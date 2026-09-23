@@ -1,0 +1,21 @@
+# ===== 生成产物（可由 compute_terrain_matrices.m 重新生成）=====
+flightBase.mat
+
+# ===== MATLAB 自动保存与临时文件 =====
+*.asv
+*.autosave
+*.m~
+*.slxc
+slprj/
+*.slprj/
+codegen/
+
+# ===== Office / Excel 锁文件与临时文件 =====
+~$*
+*.tmp
+
+# ===== 编辑器 / 系统 =====
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
