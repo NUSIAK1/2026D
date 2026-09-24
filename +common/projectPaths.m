@@ -14,6 +14,7 @@ paths.BaseDataDir = fullfile(sourceDataDir,'无人机应急物资运输基础数
 paths.GeoDataDir = fullfile(sourceDataDir,'镇龙乡地理空间数据');
 paths.NodeFile = fullfile(paths.BaseDataDir,'调度中心与服务区.xlsx');
 paths.TransportUavFile = fullfile(paths.BaseDataDir,'运输无人机数据.xlsx');
+paths.DemandFile = fullfile(paths.BaseDataDir,'物资需求与配送时限.xlsx');
 paths.DemFile = fullfile(paths.GeoDataDir,'镇龙乡及周边地理数据', ...
     '数字高程模型数据（DEM）','镇龙乡及周边30米DEM.mat');
 paths.TemplateFile = fullfile(projectRoot,'原始题目信息','结果提交模板.xlsx');
