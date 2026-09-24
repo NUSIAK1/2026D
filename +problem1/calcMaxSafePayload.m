@@ -5,10 +5,10 @@ function [qMaxRow, detail] = calcMaxSafePayload(serviceID, flightBase, reserveOv
 % O01 -> Si -> O01 单点直接往返任务时的最大安全载荷。
 %
 % 基本调用：
-%   [q, detail] = calcMaxSafePayload("S001", flightBase);
+%   [q, detail] = problem1.calcMaxSafePayload("S001", flightBase);
 %
 % 安全余量敏感性分析（可选）：
-%   [q, detail] = calcMaxSafePayload("S001", flightBase, 0.25);
+%   [q, detail] = problem1.calcMaxSafePayload("S001", flightBase, 0.25);
 %
 % reserveOverride 可取：
 %   []          使用附件中各机型的返航电量下限
@@ -16,7 +16,8 @@ function [qMaxRow, detail] = calcMaxSafePayload(serviceID, flightBase, reserveOv
 %   [0.2 0.25 0.3]  A/B/C分别采用20%、25%、30%
 %
 % 本函数不读取DEM、不重新计算节点距离、不重新提取路径高程；
-% 直接使用主脚本已经得到的 D、Hup 等基础矩阵。
+% 直接使用传入的 D、Hup 等基础矩阵，航段能耗统一由
+% common.calcLegCost 计算。
 %
 % 核心逻辑：
 %   去程：O01 -> Si，载荷为 q
@@ -115,25 +116,15 @@ distanceOneWay = repmat(D(idxO,idxS),nModel,1);
 climbOut = repmat(Hup(idxO,idxS),nModel,1);
 climbBack = repmat(Hup(idxS,idxO),nModel,1);
 
-g0 = 9.81;       % m/s^2
 tolQ = 1e-6;     % kg
 maxIter = 100;
 
-dOut  = D(idxO,idxS);
-dBack = D(idxS,idxO);
-
-hOut  = Hup(idxO,idxS);
-hBack = Hup(idxS,idxO);
-
 for g = 1:nModel
 
-    m0    = uav.EmptyMass(g);
     Qg    = uav.MaxPayload(g);
-    L0    = uav.RangeEmpty(g);
-    LF    = uav.RangeFull(g);
     Euse  = uav.BatteryUse(g);
     rho   = rhoVec(g);
-    etaUp = uav.EtaClimb(g);
+    modelID = uav.ID(g);
 
     ratedMax(g) = Qg;
     energyLimit(g) = (1-rho)*Euse;
@@ -142,10 +133,8 @@ for g = 1:nModel
     % 1. 空载返程能耗
     % =====================================================================
 
-    EhorBack = Euse*dBack/L0;
-    EupBack  = m0*g0*hBack/(etaUp*3.6e6);
-
-    Eback = EhorBack + EupBack;
+    returnLeg = common.calcLegCost(serviceID,"O01",modelID,0,flightBase);
+    Eback = returnLeg.E_total;
 
     returnEmptyEnergy(g) = Eback;
 
@@ -153,14 +142,7 @@ for g = 1:nModel
     % 2. 载荷相关的去程和完整往返能耗
     % =====================================================================
 
-    Lfun = @(q) ...
-        L0 - (L0-LF).*(q./Qg).^(3/2);
-
-    EoutFun = @(q) ...
-        Euse*dOut./Lfun(q) + ...
-        (m0+q).*g0*hOut/(etaUp*3.6e6);
-
-    EroundFun = @(q) EoutFun(q) + Eback;
+    EroundFun = @(q) roundTripEnergy(q,serviceID,modelID,flightBase,Eback);
 
     E0 = EroundFun(0);
     EF = EroundFun(Qg);
@@ -255,7 +237,8 @@ for g = 1:nModel
     end
 
     energyAtQmax(g) = EroundFun(qStar);
-    outboundEnergyAtQmax(g) = EoutFun(qStar);
+    outboundLeg = common.calcLegCost("O01",serviceID,modelID,qStar,flightBase);
+    outboundEnergyAtQmax(g) = outboundLeg.E_total;
 
     energyMargin(g) = energyLimit(g)-energyAtQmax(g);
 
@@ -305,4 +288,9 @@ detail = table( ...
     'EmptyRoundTripFeasible', ...
     'FullRatedLoadFeasible'});
 
+end
+
+function energy = roundTripEnergy(payload,serviceID,modelID,flightBase,returnEnergy)
+outboundLeg = common.calcLegCost("O01",serviceID,modelID,payload,flightBase);
+energy = outboundLeg.E_total + returnEnergy;
 end

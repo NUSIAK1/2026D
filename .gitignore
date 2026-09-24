@@ -1,5 +1,5 @@
-# ===== 生成产物（可由 compute_terrain_matrices.m 重新生成）=====
-flightBase.mat
+# ===== 生成缓存（可由 common.computeTerrainMatrices 重新生成）=====
+/cache/
 
 # ===== MATLAB 自动保存与临时文件 =====
 *.asv

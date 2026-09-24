@@ -1,7 +1,8 @@
-function out = calcLegCost(startID, endID, modelID, payload)
+function out = calcLegCost(startID, endID, modelID, payload, flightBase)
 %CALCLEGCOST 计算指定航段在给定机型与载荷下的时间与能耗
 %
-%   out = calcLegCost(startID, endID, modelID, payload)
+%   out = common.calcLegCost(startID, endID, modelID, payload)
+%   out = common.calcLegCost(startID, endID, modelID, payload, flightBase)
 %
 %   输入：
 %       startID  - 起点编号，字符串，如 "O01"
@@ -30,18 +31,28 @@ function out = calcLegCost(startID, endID, modelID, payload)
 %           E_total    单航段总能耗 (kWh)
 %           budget     按返航余量折算的单组电池可用能量 (kWh)
 %
-%   依赖：当前目录下由 compute_terrain_matrices.m 生成的 flightBase.mat。
+%   flightBase 可选。传入时直接使用内存中的基础数据，适合批量计算；
+%   省略时从标准缓存路径代码/cache/flightBase.mat 读取。
 
     %% 载入基础数据
-    baseFile = fullfile(fileparts(mfilename('fullpath')), 'flightBase.mat');
-    if ~isfile(baseFile)
-        baseFile = 'flightBase.mat';
+    if nargin < 5 || isempty(flightBase)
+        paths = common.projectPaths();
+        baseFile = paths.FlightBaseFile;
+        if ~isfile(baseFile)
+            error(['未找到 flightBase.mat。' ...
+                   '请先运行 common.computeTerrainMatrices() 生成基础矩阵。']);
+        end
+        S = load(baseFile);
+    else
+        S = flightBase;
     end
-    if ~isfile(baseFile)
-        error(['未找到 flightBase.mat。' ...
-               '请先运行 compute_terrain_matrices.m 生成基础矩阵。']);
+
+    requiredFields = {'nodes','uav','D','Hup','Hdown','Hcruise','HterrainMax'};
+    for k = 1:numel(requiredFields)
+        if ~isfield(S, requiredFields{k})
+            error('flightBase 缺少字段：%s。', requiredFields{k});
+        end
     end
-    S = load(baseFile);
 
     nodes       = S.nodes;
     uav         = S.uav;
