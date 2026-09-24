@@ -20,28 +20,33 @@ base = precomputeLegs(data, S, config.Verbose);
 archiveSolutions = {};
 archiveOutcomes = {};
 runLog = table();
-bestSeedSolution = [];
-bestSeedOutcome = [];
 overallClock = tic;
 completedIterations = 0;
 plannedIterations = config.NumRuns*config.MaxIterations;
 
 for runIdx = 1:config.NumRuns
+    if toc(overallClock) >= config.TimeLimit_s
+        break;
+    end
     if config.ProgressEnabled
         fprintf('[Q2] 开始 ALNS 第 %d/%d 次独立运行（最多 %d 次迭代）。\n', ...
             runIdx,config.NumRuns,config.MaxIterations);
     end
     rng(config.RandomSeed+runIdx-1,'twister');
-    current = buildInitialSolution(data, base);
+    current = buildInitialSolution(data, base, config);
+    seedTripCount = numel(current.Trips);
     current = repairHardDeadlines(current, data, base, config);
     currentOutcome = decodeSolution(current, data, base);
-    [archiveSolutions,archiveOutcomes,added] = updateArchive( ...
+    [archiveSolutions,archiveOutcomes,~] = updateArchive( ...
         archiveSolutions, archiveOutcomes, current, currentOutcome, config.ArchiveSize);
 
-    destroyScore = ones(1,3);
+    destroyScore = ones(1,5);
     stagnant = 0;
     accepted = 0;
     for iter = 1:config.MaxIterations
+        if toc(overallClock) >= config.TimeLimit_s
+            break;
+        end
         operator = roulette(destroyScore);
         candidate = perturbSolution(current, data, base, operator);
         candidate = repairHardDeadlines(candidate, data, base, config);
@@ -57,7 +62,8 @@ for runIdx = 1:config.NumRuns
             stagnant = stagnant+1;
         end
 
-        temperature = max(0.01, 1-iter/config.MaxIterations);
+        % 目标已经按量级缩放，温度须与缩放后的目标同量纲。
+        temperature = max(0.02, 1-iter/config.MaxIterations);
         if acceptCandidate(currentOutcome,candidateOutcome,temperature)
             current = candidate;
             currentOutcome = candidateOutcome;
@@ -85,16 +91,12 @@ for runIdx = 1:config.NumRuns
         end
     end
 
-    runRow = table(runIdx,iter,accepted,currentOutcome.Feasible, ...
+    runRow = table(runIdx,seedTripCount,iter,accepted,currentOutcome.Feasible, ...
         currentOutcome.Objectives(1),currentOutcome.Objectives(2), ...
         currentOutcome.Objectives(3),currentOutcome.Objectives(4), ...
-        'VariableNames',{'Run','Iterations','Accepted','Feasible', ...
+        'VariableNames',{'Run','SeedTripCount','Iterations','Accepted','Feasible', ...
         'Timeliness','Makespan_s','Energy_kWh','TripCount'});
     runLog = [runLog;runRow]; %#ok<AGROW>
-    if isempty(bestSeedOutcome) || scoreOutcome(currentOutcome) < scoreOutcome(bestSeedOutcome)
-        bestSeedSolution = current;
-        bestSeedOutcome = currentOutcome;
-    end
     if config.SaveRunArchive
         checkpointFile = saveRunCheckpoint(archiveSolutions,archiveOutcomes, ...
             runLog,config,runIdx,completedIterations,toc(overallClock));
@@ -119,12 +121,18 @@ result = struct();
 result.Config = config;
 result.DataSummary = table(height(data.Boxes),sum(data.Boxes.Mass_kg), ...
     sum(data.Boxes.Volume_m3),'VariableNames',{'BoxCount','TotalMass_kg','TotalVolume_m3'});
+result.Diagnostics = struct( ...
+    'MassLowerBound',ceil(sum(data.Boxes.Mass_kg)/max(data.Models.MaxPayload_kg)), ...
+    'VolumeLowerBound',ceil(sum(data.Boxes.Volume_m3)/max(data.Models.MaxVolume_m3)), ...
+    'PackingSeedTripCount',min(runLog.SeedTripCount), ...
+    'SelectedTripCount',selectedOutcome.Objectives(4));
 result.Selected = struct('Solution',selectedSolution,'Objectives', ...
     objectiveStruct(selectedOutcome.Objectives),'Trips',selectedOutcome.Trips, ...
     'Deliveries',selectedOutcome.Deliveries,'DroneTimeline',selectedOutcome.DroneTimeline, ...
     'BatteryTimeline',selectedOutcome.BatteryTimeline);
 result.ParetoFront = paretoTable;
 result.ParetoSolutions = archiveSolutions;
+result.ParetoOutcomes = archiveOutcomes;
 result.Validation = validation;
 result.RunLog = runLog;
 result.OutputFiles = struct();
@@ -148,13 +156,15 @@ defaults = struct( ...
     'ResultDir',paths.ResultDir, ...
     'ExportFiles',true, ...
     'RandomSeed',2026, ...
-    'NumRuns',10, ...
-    'MaxIterations',10000, ...
-    'StagnationLimit',2000, ...
-    'ArchiveSize',500, ...
+    'NumRuns',5, ...
+    'MaxIterations',5000, ...
+    'TimeLimit_s',1200, ...
+    'StagnationLimit',500, ...
+    'ArchiveSize',200, ...
+    'ExportParetoArchive',true, ...
     'ProgressEnabled',true, ...
     'ProgressEvery',100, ...
-    'SaveRunArchive',true, ...
+    'SaveRunArchive',false, ...
     'CheckpointDir',fullfile(paths.ResultDir,'问题二_ALNS检查点'), ...
     'Verbose',true);
 names = fieldnames(defaults);
@@ -252,55 +262,49 @@ for g = 1:gCount
     end
 end
 base.NodeIndex = containers.Map(cellstr(data.NodeIDs),num2cell(1:n));
+base.CacheKey = sprintf('%.8g_%.8g',sum(base.Time_s(:),'omitnan'), ...
+    sum(base.Energy_kWh(:),'omitnan'));
 end
 
-function solution = buildInitialSolution(data, base)
-n = height(data.Boxes);
+function solution = buildInitialSolution(data, base, config)
+% 从问题一的精确单点组批取得紧凑的可行装载，再由问题二处理
+% 实体无人机、电池和硬时限。问题一的 18 趟结果是高质量热启动，
+% 避免逐箱贪心把 49 个软货箱拆成 49 个单箱架次。
 solution = emptySolution();
-
-% 先为每个服务区的医疗/首批货箱建立独立紧急架次。软货箱不得在
-% 初始构造阶段并入这些架次，以免增加准备、装载和交接时间而压缩硬时限。
-hardMask = ~isnan(data.Boxes.HardDeadline_s);
-hardServices = unique(data.Boxes.ServiceID(hardMask),'stable');
-for s = 1:numel(hardServices)
-    boxIdx = find(data.Boxes.ServiceID == hardServices(s) & hardMask).';
-    best = []; bestTime = inf;
-    for g = 1:height(data.Models)
-        candidate = struct('BoxIdx',boxIdx,'Stops',hardServices(s), ...
-            'Model',data.Models.Model(g));
-        info = evaluateTrip(candidate,data,base);
-        if info.Feasible
-            hardOffsets = info.DeliveryOffset_s;
-            hardDeadline = data.Boxes.HardDeadline_s(boxIdx);
-            if all(hardOffsets <= hardDeadline+1e-7) && max(hardOffsets) < bestTime
-                best = candidate; bestTime = max(hardOffsets);
-            end
+try
+    q1Config = struct('ExportFiles',false,'ReserveRatios',0.20, ...
+        'BaselineRatio',0.20,'FlightBaseFile',config.FlightBaseFile);
+    q1 = problem1.solveProblem1Pareto(q1Config);
+    q1Trips = q1.Selected.Trips;
+    for r = 1:height(q1Trips)
+        ids = split(string(q1Trips.BoxIDs(r)),',');
+        boxIdx = zeros(1,numel(ids));
+        for k = 1:numel(ids)
+            boxIdx(k) = find(data.Boxes.BoxID == ids(k),1);
         end
+        candidate = struct('BoxIdx',{boxIdx},'Stops',string(q1Trips.ServiceID(r)), ...
+            'Model',string(q1Trips.ModelID(r)));
+        if ~evaluateTrip(candidate,data,base).Feasible
+            error('问题一热启动架次 %d 在问题二口径下不可行。',r);
+        end
+        solution.Trips(end+1) = candidate; %#ok<AGROW>
     end
-    if isempty(best)
-        error('服务区 %s 的医疗/首批货箱无法形成单独可行架次。',hardServices(s));
-    end
-    solution.Trips(end+1) = best;
-end
-
-remaining = find(~hardMask).';
-[~,perm] = sortrows([data.Boxes.ExpectedDeadline_s(remaining), ...
-    -data.Boxes.Priority(remaining)],[1 2]);
-order = remaining(perm);
-for q = 1:numel(order)
-    solution = insertBoxGreedy(solution,order(q),data,base);
+catch ME
+    warning('问题一热启动不可用，改用容量优先构造：%s',ME.message);
+    solution = buildCapacitySeed(data,base);
 end
 solution.Order = urgencyOrder(solution,data);
 end
 
-function solution = buildInitialSolution_legacy(data, base) %#ok<DEFNU>
-n = height(data.Boxes); %#ok<NASGU>
-[~,order] = sortrows([isnan(data.Boxes.HardDeadline_s), ...
-    replaceNaN(data.Boxes.HardDeadline_s,inf),data.Boxes.ExpectedDeadline_s, ...
-    -data.Boxes.Priority],[1 2 3 4]);
+function solution = buildCapacitySeed(data,base)
+% 备用构造：按截止时间、优先级和质量排序，再按真正的边际成本插入。
 solution = emptySolution();
-for q = 1:numel(order)
-    solution = insertBoxGreedy(solution,order(q),data,base);
+hard = data.Boxes.HardDeadline_s;
+hard(isnan(hard)) = inf;
+[~,order] = sortrows([hard,data.Boxes.ExpectedDeadline_s, ...
+    -data.Boxes.Priority,-data.Boxes.Mass_kg],[1 2 3 4]);
+for k = 1:numel(order)
+    solution = insertBoxGreedy(solution,order(k),data,base);
 end
 solution.Order = urgencyOrder(solution,data);
 end
@@ -309,17 +313,28 @@ function solution = perturbSolution(solution,data,base,operator)
 if isempty(solution.Trips), return; end
 nTrip = numel(solution.Trips);
 switch operator
-    case 1 % 随机货箱破坏
+    case 1 % 自适应随机货箱破坏（10%--30%）
         allBox = [solution.Trips.BoxIdx];
-        remove = allBox(randperm(numel(allBox),min(numel(allBox),randi([2,min(8,numel(allBox))]))));
-    case 2 % 相关服务区破坏
+        nRemove = min(numel(allBox),max(2,round(numel(allBox)*(0.10+0.20*rand))));
+        remove = allBox(randperm(numel(allBox),nRemove));
+    case 2 % 相关服务区破坏：整服务区一起重组
         seedTrip = solution.Trips(randi(nTrip));
         seedService = seedTrip.Stops(randi(numel(seedTrip.Stops)));
         allServices = data.Boxes.ServiceID;
         remove = find(allServices == seedService);
-        if numel(remove) > 8, remove = remove(randperm(numel(remove),8)); end
-    otherwise % 整架次或最差架次破坏
+        if numel(remove) < 8
+            related = find(ismember(allServices,seedTrip.Stops));
+            remove = unique([remove(:);related(:)]).';
+        end
+    case 3 % 整架次破坏
         idx = randi(nTrip);
+        remove = solution.Trips(idx).BoxIdx;
+    case 4 % 两条架次联合破坏，为路线合并创造机会
+        pick = randperm(nTrip,min(2,nTrip));
+        remove = [solution.Trips(pick).BoxIdx];
+    otherwise % 大容量/低利用率架次破坏
+        mass = arrayfun(@(x)sum(data.Boxes.Mass_kg(x.BoxIdx)),solution.Trips);
+        [~,idx] = min(mass);
         remove = solution.Trips(idx).BoxIdx;
 end
 solution = removeBoxes(solution,remove,data);
@@ -341,10 +356,35 @@ if ~isempty(solution.Trips) && rand < 0.35
         solution.Trips(r).Model = feasibleModels(randi(numel(feasibleModels)));
     end
 end
+solution = tryRandomRouteMerge(solution,data,base);
 solution.Order = urgencyOrder(solution,data);
 if rand < 0.3 && numel(solution.Order) >= 2
     p = randperm(numel(solution.Order),2);
     solution.Order(p) = solution.Order(fliplr(p));
+end
+
+function solution = tryRandomRouteMerge(solution,data,base)
+% 随机尝试合并两条架次。成功时架次数立刻减少；后续解码器再判断
+% 实体资源与硬时限，避免把不可行合并写入档案。
+if numel(solution.Trips) < 2 || rand > 0.55, return; end
+pair = randperm(numel(solution.Trips),2);
+a = solution.Trips(pair(1)); b = solution.Trips(pair(2));
+stops = unique([a.Stops,b.Stops],'stable');
+boxes = unique([a.BoxIdx,b.BoxIdx],'stable');
+models = [a.Model;b.Model;data.Models.Model];
+models = unique(models,'stable');
+best = []; bestScore = inf;
+for k = 1:numel(models)
+    candidate = struct('BoxIdx',{boxes},'Stops',stops,'Model',models(k));
+    info = evaluateTrip(candidate,data,base);
+    if info.Feasible && tripScore(info) < bestScore
+        best = candidate; bestScore = tripScore(info);
+    end
+end
+if ~isempty(best)
+    keep = true(1,numel(solution.Trips)); keep(pair) = false;
+    solution.Trips = [solution.Trips(keep),best];
+end
 end
 end
 
@@ -353,12 +393,8 @@ best = []; bestScore = inf;
 for r = 1:numel(solution.Trips)
     original = solution.Trips(r);
     service = data.Boxes.ServiceID(boxIdx);
-    % 初始构造中，软货箱不并入含硬时限货箱的架次；后续 ALNS 可在
-    % 调度可行性校验下自行探索此类合并。
-    if isnan(data.Boxes.HardDeadline_s(boxIdx)) && ...
-            any(~isnan(data.Boxes.HardDeadline_s(original.BoxIdx)))
-        continue;
-    end
+    originalInfo = evaluateTrip(original,data,base);
+    if ~originalInfo.Feasible, continue; end
     if any(original.Stops == service)
         candidate = original;
         candidate.BoxIdx = [candidate.BoxIdx,boxIdx];
@@ -367,8 +403,9 @@ for r = 1:numel(solution.Trips)
         for g = 1:numel(models)
             candidate.Model = models(g);
             info = evaluateTrip(candidate,data,base);
-            if info.Feasible && tripScore(info) < bestScore
-                best = struct('Trip',candidate,'Index',r); bestScore = tripScore(info);
+            delta = tripScore(info)-tripScore(originalInfo);
+            if info.Feasible && delta < bestScore
+                best = struct('Trip',candidate,'Index',r); bestScore = delta;
             end
         end
     else
@@ -380,8 +417,9 @@ for r = 1:numel(solution.Trips)
             for g = 1:numel(models)
                 candidate.Model = models(g);
                 info = evaluateTrip(candidate,data,base);
-                if info.Feasible && tripScore(info) < bestScore
-                    best = struct('Trip',candidate,'Index',r); bestScore = tripScore(info);
+                delta = tripScore(info)-tripScore(originalInfo);
+                if info.Feasible && delta < bestScore
+                    best = struct('Trip',candidate,'Index',r); bestScore = delta;
                 end
             end
         end
@@ -416,6 +454,17 @@ end
 end
 
 function info = evaluateTrip(trip,data,base)
+persistent tripCache cacheKey
+if isempty(cacheKey) || ~strcmp(cacheKey,base.CacheKey)
+    tripCache = containers.Map('KeyType','char','ValueType','any');
+    cacheKey = base.CacheKey;
+end
+key = char(strjoin([string(trip.Model),strjoin(string(trip.BoxIdx),','), ...
+    strjoin(trip.Stops,'>')],'|'));
+if isKey(tripCache,key)
+    info = tripCache(key);
+    return;
+end
 boxes = data.Boxes(trip.BoxIdx,:);
 g = find(data.Models.Model == trip.Model,1);
 if isempty(g), error('未知机型 %s。',trip.Model); end
@@ -425,10 +474,12 @@ info = struct('Feasible',false,'Mass_kg',sum(boxes.Mass_kg), ...
 if info.Mass_kg > data.Models.MaxPayload_kg(g)+1e-9 || ...
         info.Volume_m3 > data.Models.MaxVolume_m3(g)+1e-12 || ...
         numel(unique(trip.Stops)) ~= numel(trip.Stops)
+    tripCache(key) = info;
     return;
 end
 if ~all(ismember(unique(boxes.ServiceID),trip.Stops)) || ...
         ~all(ismember(trip.Stops,unique(boxes.ServiceID)))
+    tripCache(key) = info;
     return;
 end
 
@@ -440,10 +491,14 @@ for h = 1:numel(trip.Stops)
     current = trip.Stops(h);
     i = base.NodeIndex(char(prev)); j = base.NodeIndex(char(current));
     if abs(payload-round(payload)) > 1e-9 || payload < 0 || payload > 80
+        tripCache(key) = info;
         return;
     end
     e = base.Energy_kWh(i,j,g,round(payload)+1);
-    if isnan(e), return; end
+    if isnan(e)
+        tripCache(key) = info;
+        return;
+    end
     energy = energy+e;
     cursor = cursor+base.Time_s(i,j,g);
     delivered = boxes.ServiceID == current;
@@ -461,11 +516,13 @@ info.Energy_kWh = energy;
 info.Duration_s = cursor;
 info.ReturnSOC = 1-energy/data.Models.BatteryUse_kWh(g);
 if energy > (1-data.Models.ReserveRatio(g))*data.Models.BatteryUse_kWh(g)+1e-9
+    tripCache(key) = info;
     return;
 end
 info.ChargeTime_s = problem2.chargeTime(info.ReturnSOC, ...
     batteryFullTime(trip.Model,data));
 info.Feasible = all(isfinite(info.DeliveryOffset_s));
+tripCache(key) = info;
 end
 
 function outcome = decodeSolution(solution,data,base)
@@ -637,7 +694,15 @@ end
 
 function value = scoreOutcome(outcome)
 o = outcome.Objectives;
-value = 1e9*(~outcome.Feasible)+outcome.Violation+1e5*o(1)+o(2)/10+100*o(3)+500*o(4);
+% 四目标采用固定、可解释的参考尺度，避免原始秒/kWh/架次量纲让
+% 模拟退火退化为只接受改进的贪心过程。正式 Pareto 支配判断仍使用
+% 未缩放的原始目标值。
+if ~outcome.Feasible
+    value = 1e6 + outcome.Violation;
+    return;
+end
+scale = [1,2e4,50,20];
+value = mean(o./scale);
 end
 
 function op = roulette(weights)
@@ -684,6 +749,7 @@ function files = exportResults(result,data,config)
 if ~exist(config.ResultDir,'dir'), mkdir(config.ResultDir); end
 submission = fullfile(config.ResultDir,'问题二_结果提交.xlsx');
 analysis = fullfile(config.ResultDir,'问题二_多目标调度分析.xlsx');
+archiveFile = fullfile(config.ResultDir,'问题二_Pareto完整档案.mat');
 copyfile(config.TemplateFile,submission,'f');
 trips = sortrows(result.Selected.Trips,{'Start_s','TripID'});
 officialTrip = trips(:,{'TripID','DroneID','Model','BatteryID','Start_s','Route','Return_s','Energy_kWh'});
@@ -699,13 +765,58 @@ summary = {'指标','数值';'及时性目标',result.Selected.Objectives.Timeli
 writecell(summary,analysis,'Sheet','主方案','Range','A1');
 writetable(result.Selected.Trips,analysis,'Sheet','主方案','Range','A8');
 writetable(result.ParetoFront,analysis,'Sheet','Pareto前沿','Range','A1');
+writetable(buildParetoTripTable(result),analysis,'Sheet','Pareto架次','Range','A1');
+writetable(buildParetoDeliveryTable(result),analysis,'Sheet','Pareto逐箱交付','Range','A1');
 writetable(result.Selected.Deliveries,analysis,'Sheet','逐箱交付','Range','A1');
 writetable(result.Selected.DroneTimeline,analysis,'Sheet','无人机时间线','Range','A1');
 writetable(result.Selected.BatteryTimeline,analysis,'Sheet','电池时间线','Range','A1');
 writetable(result.Validation,analysis,'Sheet','校核','Range','A1');
 writetable(result.RunLog,analysis,'Sheet','算法稳定性','Range','A1');
+diagnostics = {'指标','数值'; ...
+    '质量容量简单下界（趟）',result.Diagnostics.MassLowerBound; ...
+    '体积容量简单下界（趟）',result.Diagnostics.VolumeLowerBound; ...
+    '问题一单点组批热启动（趟）',result.Diagnostics.PackingSeedTripCount; ...
+    '问题二平衡主方案（趟）',result.Diagnostics.SelectedTripCount; ...
+    '搜索总耗时上限（s）',config.TimeLimit_s};
+writecell(diagnostics,analysis,'Sheet','求解诊断','Range','A1');
+if config.ExportParetoArchive
+    paretoArchive = struct('Config',result.Config, ...
+        'ParetoFront',result.ParetoFront, ...
+        'ParetoSolutions',{result.ParetoSolutions}, ...
+        'ParetoOutcomes',{result.ParetoOutcomes});
+    save(archiveFile,'paretoArchive','-v7.3');
+else
+    archiveFile = "";
+end
 exportFigures(result,data,config.ResultDir);
-files = struct('Submission',submission,'Analysis',analysis);
+files = struct('Submission',submission,'Analysis',analysis, ...
+    'ParetoArchive',archiveFile);
+end
+
+function T = buildParetoTripTable(result)
+parts = cell(numel(result.ParetoOutcomes),1);
+selectedID = result.ParetoFront.SolutionID(result.ParetoFront.IsSelected);
+for k = 1:numel(result.ParetoOutcomes)
+    x = result.ParetoOutcomes{k}.Trips;
+    x.SolutionID = repmat(k,height(x),1);
+    x.IsSelected = repmat(k == selectedID,height(x),1);
+    parts{k} = movevars(x,{'SolutionID','IsSelected'},'Before',1);
+end
+T = vertcat(parts{:});
+T = sortrows(T,{'SolutionID','Start_s','TripID'});
+end
+
+function T = buildParetoDeliveryTable(result)
+parts = cell(numel(result.ParetoOutcomes),1);
+selectedID = result.ParetoFront.SolutionID(result.ParetoFront.IsSelected);
+for k = 1:numel(result.ParetoOutcomes)
+    x = result.ParetoOutcomes{k}.Deliveries;
+    x.SolutionID = repmat(k,height(x),1);
+    x.IsSelected = repmat(k == selectedID,height(x),1);
+    parts{k} = movevars(x,{'SolutionID','IsSelected'},'Before',1);
+end
+T = vertcat(parts{:});
+T = sortrows(T,{'SolutionID','Delivery_s','BoxID'});
 end
 
 function checkpointFile = saveRunCheckpoint(archiveSolutions,archiveOutcomes, ...
@@ -718,12 +829,16 @@ checkpoint.CompletedIterations = completedIterations;
 checkpoint.Elapsed_s = elapsed_s;
 checkpoint.Config = config;
 checkpoint.ParetoSolutions = archiveSolutions;
-checkpoint.ParetoOutcomes = archiveOutcomes;
 if isempty(archiveOutcomes)
     checkpoint.ParetoTable = table();
+    checkpoint.ParetoObjectives = zeros(0,4);
 else
     checkpoint.ParetoTable = makeParetoTable(archiveOutcomes, ...
         chooseKneePoint(archiveOutcomes));
+    checkpoint.ParetoObjectives = zeros(numel(archiveOutcomes),4);
+    for k = 1:numel(archiveOutcomes)
+        checkpoint.ParetoObjectives(k,:) = archiveOutcomes{k}.Objectives;
+    end
 end
 checkpoint.RunLog = runLog;
 checkpointFile = fullfile(config.CheckpointDir, ...
@@ -809,10 +924,6 @@ y = a;
 for k=1:numel(a)
     if isnan(a(k)), y(k)=b(k); elseif ~isnan(b(k)), y(k)=min(a(k),b(k)); end
 end
-end
-
-function y = replaceNaN(x,value)
-y=x; y(isnan(y))=value;
 end
 
 function text = formatDuration(seconds)

@@ -45,7 +45,18 @@ options = struct( ...
 flightBase = common.computeTerrainMatrices(options);
 
 result = problem1.run_problem1(struct('ExportFiles',false));
+
+% 问题二：5 次独立运行，所有阶段合计不超过 20 分钟。
+% 求解器以问题一的紧凑组批为热启动，再处理实体无人机、电池与时限。
+q2Config = struct('NumRuns',5,'MaxIterations',5000,'TimeLimit_s',1200, ...
+    'SaveRunArchive',false);
+resultQ2 = problem2.run_problem2(q2Config);
 ```
+
+问题二的 `问题二_多目标调度分析.xlsx` 额外包含“求解诊断”、
+“Pareto架次”和“Pareto逐箱交付”工作表；后两者按 `SolutionID` 保留
+每个非支配方案的服务区访问顺序和逐箱送达结果。完整 Pareto 档案同时
+写入 `问题二_Pareto完整档案.mat`，可通过 `ExportParetoArchive=false` 关闭。
 
 ## DEM 航段高程口径
 
