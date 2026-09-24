@@ -186,7 +186,9 @@ Hcruise     = zeros(n,n);
 Hstart      = repmat(nodes.WorkElev,1,n);
 Hend        = repmat(nodes.WorkElev',n,1);
 
-R = 6371000;
+wgs84A  = 6378137;
+wgs84F  = 1/298.257223563;
+wgs84E2 = wgs84F*(2-wgs84F);
 
 for i = 1:n
     for j = i:n
@@ -198,16 +200,16 @@ for i = 1:n
             continue;
         end
 
-        % 5.1 Haversine 距离
-        phi1 = deg2rad(nodes.Lat(i));
-        phi2 = deg2rad(nodes.Lat(j));
-        dphi = deg2rad(nodes.Lat(j) - nodes.Lat(i));
-        dlam = deg2rad(nodes.Lon(j) - nodes.Lon(i));
+        % 5.1 WGS84 平均纬度局部椭球近似距离
+        phiMean = deg2rad((nodes.Lat(i) + nodes.Lat(j))/2);
+        dphi    = deg2rad(nodes.Lat(j) - nodes.Lat(i));
+        dlam    = deg2rad(nodes.Lon(j) - nodes.Lon(i));
 
-        a = sin(dphi/2)^2 + cos(phi1)*cos(phi2)*sin(dlam/2)^2;
-        a = max(0,min(1,a));
-        c = 2*atan2(sqrt(a),sqrt(1-a));
-        dij = R*c;
+        w = 1 - wgs84E2*sin(phiMean)^2;
+        M = wgs84A*(1 - wgs84E2)/w^(3/2);
+        N = wgs84A/sqrt(w);
+
+        dij = hypot(M*dphi, N*cos(phiMean)*dlam);
 
         D(i,j) = dij;
         D(j,i) = dij;
