@@ -169,6 +169,24 @@ if lonVec(1) > lonVec(end)
     Z      = fliplr(Z);
 end
 
+lonStep = median(diff(lonVec));
+latStep = median(diff(latVec));
+if lonStep <= 0 || latStep <= 0 || ...
+        any(abs(diff(lonVec)-lonStep) > 1e-10*max(1,abs(lonStep))) || ...
+        any(abs(diff(latVec)-latStep) > 1e-10*max(1,abs(latStep)))
+    error('DEM 经纬度坐标必须为严格递增的规则网格。');
+end
+
+% 整数为像元中心，半整数为像元边界；后续 supercover 遍历不插值高程。
+nodeCols = 1 + (nodes.Lon-lonVec(1))/lonStep;
+nodeRows = 1 + (nodes.Lat-latVec(1))/latStep;
+if any(nodeCols < 0.5-1e-9 | nodeCols > nCol+0.5+1e-9 | ...
+       nodeRows < 0.5-1e-9 | nodeRows > nRow+0.5+1e-9)
+    bad = find(nodeCols < 0.5-1e-9 | nodeCols > nCol+0.5+1e-9 | ...
+               nodeRows < 0.5-1e-9 | nodeRows > nRow+0.5+1e-9,1);
+    error('节点 %s 超出 DEM 范围。',nodes.ID(bad));
+end
+
 fprintf('\nDEM读取完成：%d × %d 像元，EPSG=%d\n', nRow, nCol, epsgCode);
 fprintf('经度范围：%.8f° ~ %.8f°\n', min(lonVec), max(lonVec));
 fprintf('纬度范围：%.8f° ~ %.8f°\n', min(latVec), max(latVec));
@@ -214,36 +232,10 @@ for i = 1:n
         D(i,j) = dij;
         D(j,i) = dij;
 
-        % 5.2 经纬度 -> DEM 行列号
-        col1 = interp1(lonVec,1:nCol,nodes.Lon(i),'linear');
-        col2 = interp1(lonVec,1:nCol,nodes.Lon(j),'linear');
-        row1 = interp1(latVec,1:nRow,nodes.Lat(i),'linear');
-        row2 = interp1(latVec,1:nRow,nodes.Lat(j),'linear');
-
-        if any(isnan([row1,row2,col1,col2]))
-            error('节点 %s 或 %s 超出 DEM 范围。',nodes.ID(i),nodes.ID(j));
-        end
-
-        % 5.3 栅格化两点直线，直接读原始 DEM 像元
-        deltaPix   = max(abs(row2-row1),abs(col2-col1));
-        nSamplePix = max(2,ceil(4*deltaPix)+1);
-
-        rowPath = round(linspace(row1,row2,nSamplePix));
-        colPath = round(linspace(col1,col2,nSamplePix));
-        rowPath = max(1,min(nRow,rowPath));
-        colPath = max(1,min(nCol,colPath));
-
-        linearIndex = sub2ind([nRow,nCol],rowPath,colPath);
-        linearIndex = unique(linearIndex,'stable');
-
-        zPath = Z(linearIndex);
-        zPath = zPath(~isnan(zPath));
-
-        if isempty(zPath)
-            hTerrain = max(nodes.GroundElev(i),nodes.GroundElev(j));
-        else
-            hTerrain = max(zPath);
-        end
+        % 5.2 Amanatides--Woo 闭合 supercover：完整纳入线段接触的 DEM 像元。
+        pixels = common.traceDemSupercover([nodeCols(i),nodeRows(i)], ...
+            [nodeCols(j),nodeRows(j)],[nRow,nCol]);
+        hTerrain = common.maxDemOnPath(Z,pixels,nodes.ID(i),nodes.ID(j));
 
         HterrainMax(i,j) = hTerrain;
         HterrainMax(j,i) = hTerrain;
@@ -355,7 +347,8 @@ if writeResultXlsx
         'DEM file', demFile;
         'EPSG',     epsgCode;
         'NoData',   nodataVal;
-        'Transform', mat2str(transform,12)
+        'Transform', mat2str(transform,12);
+        'DEM traversal','Amanatides-Woo 2D closed supercover'
         };
     writecell(meta, resultFile, 'Sheet', 'Metadata');
 
