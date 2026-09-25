@@ -16,10 +16,17 @@ end
 S = load(config.FlightBaseFile);
 data = loadProblemData(config, S);
 base = precomputeLegs(data, S, config.Verbose);
+warmStart = loadExternalWarmStart(data,base,config);
 
 archiveSolutions = {};
 archiveOutcomes = {};
 runLog = table();
+convergenceLog = table();
+operatorLog = table();
+operatorNames = ["随机货箱","相关服务区","整架次","双架次", ...
+    "拆分至A","机型均衡","路线交换","低载架次", ...
+    "瓶颈顺序","瓶颈拆分","瓶颈转移"];
+operatorCounts = zeros(numel(operatorNames),8);
 overallClock = tic;
 completedIterations = 0;
 plannedIterations = config.NumRuns*config.MaxIterations;
@@ -33,28 +40,48 @@ for runIdx = 1:config.NumRuns
             runIdx,config.NumRuns,config.MaxIterations);
     end
     rng(config.RandomSeed+runIdx-1,'twister');
-    current = buildInitialSolution(data, base, config);
+    profile = config.RunProfiles(mod(runIdx-1,numel(config.RunProfiles))+1);
+    current = buildInitialSolution(data, base, config, profile, runIdx, warmStart);
+    if runIdx > 1
+        current = diversifyRestart(current,archiveSolutions,archiveOutcomes, ...
+            data,base,profile,runIdx);
+    end
     seedTripCount = numel(current.Trips);
     current = repairHardDeadlines(current, data, base, config);
     currentOutcome = decodeSolution(current, data, base);
-    [archiveSolutions,archiveOutcomes,~] = updateArchive( ...
+    if ~currentOutcome.Feasible && warmStart.Enabled
+        current = warmStart.Solution;
+        currentOutcome = decodeSolution(current,data,base);
+    end
+    [archiveSolutions,archiveOutcomes,~] = problem2.updateParetoArchive( ...
         archiveSolutions, archiveOutcomes, current, currentOutcome, config.ArchiveSize);
 
-    destroyScore = ones(1,5);
+    destroyScore = ones(1,numel(operatorNames));
     stagnant = 0;
     accepted = 0;
+    runClock = tic;
+    runBudget_s = max(0,(config.TimeLimit_s-toc(overallClock))/ ...
+        (config.NumRuns-runIdx+1));
     for iter = 1:config.MaxIterations
-        if toc(overallClock) >= config.TimeLimit_s
+        if toc(overallClock) >= config.TimeLimit_s || toc(runClock) >= runBudget_s
             break;
         end
         operator = roulette(destroyScore);
-        candidate = perturbSolution(current, data, base, operator);
+        candidate = perturbSolution(current, data, base, operator, profile);
         candidate = repairHardDeadlines(candidate, data, base, config);
         candidateOutcome = decodeSolution(candidate, data, base);
 
-        [archiveSolutions,archiveOutcomes,isAdded] = updateArchive( ...
+        [archiveSolutions,archiveOutcomes,archiveStatus] = problem2.updateParetoArchive( ...
             archiveSolutions, archiveOutcomes, candidate, candidateOutcome, config.ArchiveSize);
-        if isAdded
+        operatorCounts(operator,1) = operatorCounts(operator,1)+1;
+        operatorCounts(operator,2) = operatorCounts(operator,2)+candidateOutcome.Feasible;
+        switch archiveStatus
+            case "dominated", operatorCounts(operator,3) = operatorCounts(operator,3)+1;
+            case "duplicate", operatorCounts(operator,4) = operatorCounts(operator,4)+1;
+            case "added", operatorCounts(operator,5) = operatorCounts(operator,5)+1;
+            case "pruned", operatorCounts(operator,6) = operatorCounts(operator,6)+1;
+        end
+        if archiveStatus == "added"
             destroyScore(operator) = 0.85*destroyScore(operator)+0.15*6;
             stagnant = 0;
         else
@@ -62,14 +89,31 @@ for runIdx = 1:config.NumRuns
             stagnant = stagnant+1;
         end
 
-        % 目标已经按量级缩放，温度须与缩放后的目标同量纲。
-        temperature = max(0.02, 1-iter/config.MaxIterations);
-        if acceptCandidate(currentOutcome,candidateOutcome,temperature)
+        % 按本次实际时段降温，避免时间上限先到而温度始终偏高。
+        progress = max(iter/config.MaxIterations, ...
+            min(1,toc(runClock)/max(runBudget_s,eps)));
+        temperature = config.InitialTemperature* ...
+            (config.FinalTemperature/config.InitialTemperature)^progress;
+        previousScore = scoreOutcome(currentOutcome,profile);
+        candidateScore = scoreOutcome(candidateOutcome,profile);
+        if acceptCandidate(currentOutcome,candidateOutcome,temperature,profile, ...
+                config.WorseAcceptanceCap)
             current = candidate;
             currentOutcome = candidateOutcome;
             accepted = accepted+1;
+            operatorCounts(operator,7) = operatorCounts(operator,7)+1;
+            if candidateScore > previousScore+1e-12
+                operatorCounts(operator,8) = operatorCounts(operator,8)+1;
+            end
         end
         completedIterations = completedIterations+1;
+        [bestObjectives,bestCount] = archiveSummary(archiveOutcomes);
+        convergenceLog = [convergenceLog; table(runIdx,string(profile),iter, ...
+            completedIterations,toc(overallClock),numel(archiveOutcomes),bestCount, ...
+            bestObjectives(1),bestObjectives(2),bestObjectives(3),bestObjectives(4), ...
+            'VariableNames',{'Run','Profile','Iteration','CompletedIterations', ...
+            'Elapsed_s','ArchiveSize','FeasibleArchiveSize','BestTimeliness', ...
+            'BestMakespan_s','BestEnergy_kWh','BestTripCount'})]; %#ok<AGROW>
         if config.ProgressEnabled && (iter == 1 || ...
                 mod(iter,config.ProgressEvery) == 0 || iter == config.MaxIterations)
             elapsed_s = toc(overallClock);
@@ -88,15 +132,27 @@ for runIdx = 1:config.NumRuns
                     runIdx,stagnant);
             end
             break;
+        elseif stagnant > 0 && mod(stagnant,config.RestartEvery) == 0
+            current = diversifyRestart(current,archiveSolutions,archiveOutcomes, ...
+                data,base,profile,runIdx+stagnant);
+            current = repairHardDeadlines(current,data,base,config);
+            currentOutcome = decodeSolution(current,data,base);
         end
     end
 
-    runRow = table(runIdx,seedTripCount,iter,accepted,currentOutcome.Feasible, ...
-        currentOutcome.Objectives(1),currentOutcome.Objectives(2), ...
-        currentOutcome.Objectives(3),currentOutcome.Objectives(4), ...
-        'VariableNames',{'Run','SeedTripCount','Iterations','Accepted','Feasible', ...
-        'Timeliness','Makespan_s','Energy_kWh','TripCount'});
+    [bestObjectives,bestCount] = archiveSummary(archiveOutcomes);
+    runRow = table(runIdx,string(profile),seedTripCount,iter,accepted, ...
+        accepted/max(iter,1),currentOutcome.Feasible,currentOutcome.Objectives(1), ...
+        currentOutcome.Objectives(2),currentOutcome.Objectives(3), ...
+        currentOutcome.Objectives(4),bestObjectives(1),bestObjectives(2), ...
+        bestObjectives(3),bestObjectives(4),bestCount, ...
+        'VariableNames',{'Run','Profile','SeedTripCount','Iterations','Accepted', ...
+        'AcceptanceRate','FinalFeasible','FinalTimeliness','FinalMakespan_s', ...
+        'FinalEnergy_kWh','FinalTripCount','BestTimeliness','BestMakespan_s', ...
+        'BestEnergy_kWh','BestTripCount','ArchiveSize'});
     runLog = [runLog;runRow]; %#ok<AGROW>
+    operatorLog = [operatorLog; table(runIdx,string(profile),destroyScore, ...
+        'VariableNames',{'Run','Profile','OperatorWeights'})]; %#ok<AGROW>
     if config.SaveRunArchive
         checkpointFile = saveRunCheckpoint(archiveSolutions,archiveOutcomes, ...
             runLog,config,runIdx,completedIterations,toc(overallClock));
@@ -111,12 +167,12 @@ if isempty(archiveOutcomes)
         '或检查基础数据与 flightBase 是否一致。']);
 end
 
-selectedIndex = chooseKneePoint(archiveOutcomes);
-selectedSolution = archiveSolutions{selectedIndex};
-selectedOutcome = archiveOutcomes{selectedIndex};
-validation = validateOutcome(selectedSolution,selectedOutcome,data,base);
+representativeIndices = chooseRepresentatives(archiveOutcomes);
+representatives = buildRepresentatives(archiveSolutions,archiveOutcomes, ...
+    representativeIndices,data,base);
+balancedIndex = representativeIndices.Balanced;
 
-paretoTable = makeParetoTable(archiveOutcomes,selectedIndex);
+paretoTable = makeParetoTable(archiveOutcomes,balancedIndex);
 result = struct();
 result.Config = config;
 result.DataSummary = table(height(data.Boxes),sum(data.Boxes.Mass_kg), ...
@@ -125,16 +181,29 @@ result.Diagnostics = struct( ...
     'MassLowerBound',ceil(sum(data.Boxes.Mass_kg)/max(data.Models.MaxPayload_kg)), ...
     'VolumeLowerBound',ceil(sum(data.Boxes.Volume_m3)/max(data.Models.MaxVolume_m3)), ...
     'PackingSeedTripCount',min(runLog.SeedTripCount), ...
-    'SelectedTripCount',selectedOutcome.Objectives(4));
-result.Selected = struct('Solution',selectedSolution,'Objectives', ...
-    objectiveStruct(selectedOutcome.Objectives),'Trips',selectedOutcome.Trips, ...
-    'Deliveries',selectedOutcome.Deliveries,'DroneTimeline',selectedOutcome.DroneTimeline, ...
-    'BatteryTimeline',selectedOutcome.BatteryTimeline);
+    'BaselineMakespan_s',config.BaselineMakespan_s, ...
+    'BestMakespan_s',representatives.MakespanFirst.Objectives.Makespan_s, ...
+    'WarmStart',warmStart.Diagnostics);
+if warmStart.Enabled
+    result.WarmStartBaseline = struct('Solution',warmStart.Solution, ...
+        'Outcome',warmStart.Outcome);
+else
+    result.WarmStartBaseline = struct('Solution',[],'Outcome',[]);
+end
+result.Representatives = representatives;
 result.ParetoFront = paretoTable;
 result.ParetoSolutions = archiveSolutions;
 result.ParetoOutcomes = archiveOutcomes;
-result.Validation = validation;
 result.RunLog = runLog;
+result.ConvergenceLog = convergenceLog;
+result.OperatorLog = operatorLog;
+result.OperatorDiagnostics = table(operatorNames.',operatorCounts(:,1), ...
+    operatorCounts(:,2),operatorCounts(:,3),operatorCounts(:,4), ...
+    operatorCounts(:,5),operatorCounts(:,6),operatorCounts(:,7), ...
+    operatorCounts(:,8),operatorCounts(:,7)./max(operatorCounts(:,1),1), ...
+    'VariableNames',{'Operator','Candidates', ...
+    'Feasible','Dominated','Duplicate','Added','Pruned', ...
+    'Accepted','AcceptedWorse','AcceptanceRate'});
 result.OutputFiles = struct();
 if config.ExportFiles
     result.OutputFiles = exportResults(result,data,config);
@@ -142,7 +211,7 @@ end
 
 if config.Verbose
     fprintf('问题二：得到 %d 个可行非支配方案，选择方案 %d。\n', ...
-        numel(archiveOutcomes), selectedIndex);
+        numel(archiveOutcomes), balancedIndex);
 end
 end
 
@@ -156,11 +225,19 @@ defaults = struct( ...
     'ResultDir',paths.ResultDir, ...
     'ExportFiles',true, ...
     'RandomSeed',2026, ...
-    'NumRuns',5, ...
-    'MaxIterations',5000, ...
+    'NumRuns',10, ...
+    'MaxIterations',2500, ...
     'TimeLimit_s',1200, ...
-    'StagnationLimit',500, ...
+    'StagnationLimit',800, ...
     'ArchiveSize',200, ...
+    'RestartEvery',120, ...
+    'InitialTemperature',0.05, ...
+    'FinalTemperature',0.002, ...
+    'WorseAcceptanceCap',0.25, ...
+    'WarmStartTripFile',"", ...
+    'WarmStartDeliveryFile',"", ...
+    'RunProfiles',["timeliness","makespan","energy","trips","balanced"], ...
+    'BaselineMakespan_s',9643.64851977594, ...
     'ExportParetoArchive',true, ...
     'ProgressEnabled',true, ...
     'ProgressEvery',100, ...
@@ -266,10 +343,188 @@ base.CacheKey = sprintf('%.8g_%.8g',sum(base.Time_s(:),'omitnan'), ...
     sum(base.Energy_kWh(:),'omitnan'));
 end
 
-function solution = buildInitialSolution(data, base, config)
+function warmStart = loadExternalWarmStart(data,base,config)
+tripFile = string(config.WarmStartTripFile);
+deliveryFile = string(config.WarmStartDeliveryFile);
+enabled = strlength(strtrim(tripFile)) > 0 || strlength(strtrim(deliveryFile)) > 0;
+emptyDiagnostics = struct('Enabled',false,'TripFile',"",'DeliveryFile',"", ...
+    'ImportedTripCount',0,'ImportedBoxCount',0,'InitialFeasible',false, ...
+    'InitialObjectives',struct(),'InitialValidation',table(), ...
+    'SchedulingFields',"未使用外部热启动");
+warmStart = struct('Enabled',false,'Solution',emptySolution(),'Outcome',[], ...
+    'Diagnostics',emptyDiagnostics);
+if ~enabled, return; end
+if strlength(strtrim(tripFile)) == 0 || strlength(strtrim(deliveryFile)) == 0
+    error('外部热启动必须同时提供 WarmStartTripFile 和 WarmStartDeliveryFile。');
+end
+if ~isfile(tripFile)
+    error('未找到外部初始解架次文件：%s',tripFile);
+end
+if ~isfile(deliveryFile)
+    error('未找到外部初始解逐箱文件：%s',deliveryFile);
+end
+
+tripRows = readWarmStartTripRows(tripFile);
+deliveryRows = readWarmStartDeliveryRows(deliveryFile);
+if height(tripRows) ~= 22
+    error('外部初始解架次文件必须包含 22 条架次，当前读取到 %d 条。',height(tripRows));
+end
+if numel(unique(tripRows.TripID)) ~= height(tripRows)
+    error('外部初始解架次文件含重复架次编号。');
+end
+if any(~isfinite(tripRows.Start_s) | tripRows.Start_s < 0)
+    error('外部初始解的开始时刻必须是非负有限数值。');
+end
+if numel(unique(deliveryRows.BoxID)) ~= height(deliveryRows)
+    error('外部初始解逐箱文件含重复货箱编号。');
+end
+if height(deliveryRows) ~= height(data.Boxes) || ...
+        ~isempty(setxor(deliveryRows.BoxID,data.Boxes.BoxID))
+    error('外部初始解必须恰好覆盖当前需求中的 %d 个货箱。',height(data.Boxes));
+end
+unknownTrips = setdiff(unique(deliveryRows.TripID),tripRows.TripID);
+if ~isempty(unknownTrips)
+    error('逐箱文件引用了架次文件中不存在的架次：%s',strjoin(unknownTrips,','));
+end
+
+solution = emptySolution();
+for r = 1:height(tripRows)
+    tripID = tripRows.TripID(r);
+    if ~ismember(tripRows.Model(r),data.Models.Model)
+        error('外部初始解架次 %s 使用未知机型 %s。',tripID,tripRows.Model(r));
+    end
+    stops = split(replace(tripRows.Route(r),"->","→"),"→");
+    stops = strip(stops); stops = stops(strlength(stops)>0);
+    if isempty(stops) || numel(unique(stops)) ~= numel(stops) || ...
+            ~all(ismember(stops,data.NodeIDs)) || any(stops == "O01")
+        error('外部初始解架次 %s 的服务区访问顺序非法。',tripID);
+    end
+    boxIDs = deliveryRows.BoxID(deliveryRows.TripID == tripID);
+    if isempty(boxIDs)
+        error('外部初始解架次 %s 未分配任何货箱。',tripID);
+    end
+    boxIdx = zeros(1,numel(boxIDs));
+    for k = 1:numel(boxIDs)
+        boxIdx(k) = find(data.Boxes.BoxID == boxIDs(k),1);
+    end
+    if ~all(ismember(unique(data.Boxes.ServiceID(boxIdx)),stops))
+        error('外部初始解架次 %s 的货箱服务区不在其访问顺序中。',tripID);
+    end
+    candidate = struct('BoxIdx',boxIdx,'Stops',stops.','Model',tripRows.Model(r));
+    info = evaluateTrip(candidate,data,base);
+    if ~info.Feasible
+        error('外部初始解架次 %s 在当前载荷、体积或能量口径下不可行。',tripID);
+    end
+    solution.Trips(end+1) = candidate; %#ok<AGROW>
+end
+[~,solution.Order] = sortrows([tripRows.Start_s,(1:height(tripRows)).'],[1 2]);
+solution.Order = solution.Order.';
+initialOutcome = decodeSolution(solution,data,base);
+initialValidation = validateOutcome(solution,initialOutcome,data,base);
+diagnostics = struct('Enabled',true,'TripFile',tripFile,'DeliveryFile',deliveryFile, ...
+    'ImportedTripCount',height(tripRows),'ImportedBoxCount',height(deliveryRows), ...
+    'InitialFeasible',initialOutcome.Feasible, ...
+    'InitialObjectives',objectiveStruct(initialOutcome.Objectives), ...
+    'InitialValidation',initialValidation, ...
+    'SchedulingFields',"表 6 的无人机、电池、返回时刻和能耗仅作审计；正式排程已按当前模型重算。");
+warmStart = struct('Enabled',true,'Solution',solution, ...
+    'Outcome',initialOutcome,'Diagnostics',diagnostics);
+end
+
+function T = readWarmStartTripRows(file)
+best = table();
+for sheet = string(sheetnames(file)).'
+    raw = readcell(file,'Sheet',sheet);
+    for r = 1:size(raw,1)
+        header = string(raw(r,:));
+        idCol = find(contains(header,"架次编号"),1);
+        modelCol = find(header == "机型",1);
+        startCol = find(contains(header,"开始"),1);
+        routeCol = find(contains(header,"访问服务区顺序"),1);
+        if isempty(idCol) || isempty(modelCol) || isempty(startCol) || isempty(routeCol), continue; end
+        id = strings(0,1); model = strings(0,1); start_s = zeros(0,1); route = strings(0,1);
+        for q = r+1:size(raw,1)
+            if warmStartBlank(raw{q,idCol}), continue; end
+            id(end+1,1) = warmStartText(raw{q,idCol}); %#ok<AGROW>
+            model(end+1,1) = warmStartText(raw{q,modelCol}); %#ok<AGROW>
+            start_s(end+1,1) = warmStartNumber(raw{q,startCol},file,sheet,q,"开始时刻"); %#ok<AGROW>
+            route(end+1,1) = warmStartText(raw{q,routeCol}); %#ok<AGROW>
+        end
+        candidate = table(id,model,start_s,route, ...
+            'VariableNames',{'TripID','Model','Start_s','Route'});
+        if height(candidate) > height(best), best = candidate; end
+    end
+end
+if isempty(best)
+    error('未在 %s 中识别到“架次编号、机型、开始、访问服务区顺序”表头。',file);
+end
+T = best;
+end
+
+function T = readWarmStartDeliveryRows(file)
+best = table();
+for sheet = string(sheetnames(file)).'
+    raw = readcell(file,'Sheet',sheet);
+    for r = 1:size(raw,1)
+        header = string(raw(r,:));
+        boxCols = find(contains(header,"货箱编号"));
+        tripCols = find(contains(header,"架次编号"));
+        timeCols = find(contains(header,"交付时刻"));
+        pairCount = min([numel(boxCols),numel(tripCols),numel(timeCols)]);
+        if pairCount == 0, continue; end
+        box = strings(0,1); trip = strings(0,1); delivery_s = zeros(0,1);
+        for q = r+1:size(raw,1)
+            for p = 1:pairCount
+                if warmStartBlank(raw{q,boxCols(p)}), continue; end
+                box(end+1,1) = warmStartText(raw{q,boxCols(p)}); %#ok<AGROW>
+                trip(end+1,1) = warmStartText(raw{q,tripCols(p)}); %#ok<AGROW>
+                delivery_s(end+1,1) = warmStartNumber(raw{q,timeCols(p)},file,sheet,q,"交付时刻"); %#ok<AGROW>
+            end
+        end
+        candidate = table(box,trip,delivery_s, ...
+            'VariableNames',{'BoxID','TripID','Delivery_s'});
+        if height(candidate) > height(best), best = candidate; end
+    end
+end
+if isempty(best)
+    error('未在 %s 中识别到“货箱编号、架次编号、交付时刻”表头。',file);
+end
+T = best;
+end
+
+function tf = warmStartBlank(value)
+tf = isempty(value) || (isstring(value) && all(ismissing(value))) || ...
+    (ischar(value) && isempty(strtrim(value)));
+end
+
+function value = warmStartText(raw)
+value = strtrim(string(raw));
+if strlength(value) == 0 || ismissing(value)
+    error('外部初始解存在空文本字段。');
+end
+end
+
+function value = warmStartNumber(raw,file,sheet,row,label)
+if isnumeric(raw) && isscalar(raw)
+    value = double(raw);
+else
+    value = str2double(string(raw));
+end
+if ~isfinite(value)
+    error('%s 中工作表 %s 第 %d 行的%s不是有效数值。',file,sheet,row,label);
+end
+end
+
+function solution = buildInitialSolution(data, base, config, profile, runIdx, warmStart)
 % 从问题一的精确单点组批取得紧凑的可行装载，再由问题二处理
 % 实体无人机、电池和硬时限。问题一的 18 趟结果是高质量热启动，
 % 避免逐箱贪心把 49 个软货箱拆成 49 个单箱架次。
+if warmStart.Enabled
+    % 外部方案已按表 6 的开始时刻排好顺序。原方案独立保留为基线，
+    % 后续运行由主流程从档案解构造不同的起点。
+    solution = warmStart.Solution;
+    return;
+end
 solution = emptySolution();
 try
     q1Config = struct('ExportFiles',false,'ReserveRatios',0.20, ...
@@ -294,6 +549,15 @@ catch ME
     solution = buildCapacitySeed(data,base);
 end
 solution.Order = urgencyOrder(solution,data);
+if profile == "makespan" || profile == "balanced"
+    solution = rebalanceSeed(solution,data,base);
+end
+if mod(runIdx,3) == 2
+    solution = splitSeedForA(solution,data,base);
+elseif mod(runIdx,3) == 0
+    solution = diversifyRouteSeed(solution,data,base);
+end
+solution.Order = initialScheduleOrder(solution,data,base,profile);
 end
 
 function solution = buildCapacitySeed(data,base)
@@ -309,7 +573,7 @@ end
 solution.Order = urgencyOrder(solution,data);
 end
 
-function solution = perturbSolution(solution,data,base,operator)
+function solution = perturbSolution(solution,data,base,operator,profile)
 if isempty(solution.Trips), return; end
 nTrip = numel(solution.Trips);
 switch operator
@@ -332,10 +596,32 @@ switch operator
     case 4 % 两条架次联合破坏，为路线合并创造机会
         pick = randperm(nTrip,min(2,nTrip));
         remove = [solution.Trips(pick).BoxIdx];
-    otherwise % 大容量/低利用率架次破坏
+    case 5 % 主动拆分 B/C 架次，让 A 型机承担并行工作
+        solution = trySplitForA(solution,data,base);
+        solution = perturbOrder(solution,data,base,profile);
+        return;
+    case 6 % 将瓶颈机型的可行架次转移到负载较低机型
+        solution = tryModelRebalance(solution,data,base);
+        solution = perturbOrder(solution,data,base,profile);
+        return;
+    case 7 % 路线顺序和跨架次货箱交换
+        solution = tryRouteNeighborhood(solution,data,base);
+        solution = tryCrossTripExchange(solution,data,base);
+        solution = perturbOrder(solution,data,base,profile);
+        return;
+    case 8 % 低利用率架次破坏
         mass = arrayfun(@(x)sum(data.Boxes.Mass_kg(x.BoxIdx)),solution.Trips);
         [~,idx] = min(mass);
         remove = solution.Trips(idx).BoxIdx;
+    case 9 % 直接调整最晚返航架次的派发位置
+        solution = improveCriticalOrder(solution,data,base,profile);
+        return;
+    case 10 % 拆分瓶颈机型的载荷给轻型机
+        solution = splitCriticalTrip(solution,data,base,profile);
+        return;
+    otherwise % 跨架次移动瓶颈架次的货箱
+        solution = transferCriticalBox(solution,data,base,profile);
+        return;
 end
 solution = removeBoxes(solution,remove,data);
 remove = remove(randperm(numel(remove)));
@@ -357,10 +643,7 @@ if ~isempty(solution.Trips) && rand < 0.35
     end
 end
 solution = tryRandomRouteMerge(solution,data,base);
-solution.Order = urgencyOrder(solution,data);
-if rand < 0.3 && numel(solution.Order) >= 2
-    p = randperm(numel(solution.Order),2);
-    solution.Order(p) = solution.Order(fliplr(p));
+solution = perturbOrder(solution,data,base,profile);
 end
 
 function solution = tryRandomRouteMerge(solution,data,base)
@@ -383,9 +666,321 @@ for k = 1:numel(models)
 end
 if ~isempty(best)
     keep = true(1,numel(solution.Trips)); keep(pair) = false;
-    solution.Trips = [solution.Trips(keep),best];
+    solution = retainTrips(solution,keep);
+    solution.Trips(end+1) = best;
+    solution.Order = [solution.Order,numel(solution.Trips)];
 end
 end
+
+function solution = splitSeedForA(solution,data,base)
+for k = 1:min(4,numel(solution.Trips))
+    before = numel(solution.Trips);
+    solution = trySplitForA(solution,data,base);
+    if numel(solution.Trips) == before, break; end
+end
+end
+
+function solution = rebalanceSeed(solution,data,base)
+for k = 1:min(6,numel(solution.Trips))
+    changed = tryModelRebalance(solution,data,base);
+    if isequaln(changed,solution), break; end
+    solution = changed;
+end
+end
+
+function solution = diversifyRouteSeed(solution,data,base)
+for r = 1:numel(solution.Trips)
+    if numel(solution.Trips(r).Stops) > 1 && rand < 0.6
+        solution.Trips(r).Stops = solution.Trips(r).Stops(randperm(numel(solution.Trips(r).Stops)));
+    end
+end
+end
+
+function solution = trySplitForA(solution,data,base)
+% 将 B/C 的一部分货箱拆出给 A 型机，目标是释放瓶颈机型的并行容量。
+candidateIdx = find([solution.Trips.Model] ~= "A" & ...
+    arrayfun(@(x)numel(x.BoxIdx)>=2,solution.Trips));
+if isempty(candidateIdx), return; end
+r = candidateIdx(randi(numel(candidateIdx)));
+trip = solution.Trips(r);
+boxOrder = trip.BoxIdx(randperm(numel(trip.BoxIdx)));
+pick = zeros(1,0);
+for b = boxOrder
+    test = [pick,b];
+    stops = stopsForBoxes(test,trip.Stops,data);
+    aTrip = struct('BoxIdx',test,'Stops',stops,'Model',"A");
+    remainder = setdiff(trip.BoxIdx,test,'stable');
+    if evaluateTrip(aTrip,data,base).Feasible && ~isempty(remainder)
+        remTrip = trip;
+        remTrip.BoxIdx = remainder;
+        remTrip.Stops = stopsForBoxes(remainder,trip.Stops,data);
+        if evaluateTrip(remTrip,data,base).Feasible
+            solution.Trips(r) = remTrip;
+            solution.Trips(end+1) = aTrip;
+            pos = find(solution.Order == r,1);
+            if isempty(pos)
+                solution.Order = 1:(numel(solution.Trips)-1);
+                pos = numel(solution.Order)+1;
+            end
+            solution.Order = [solution.Order(1:pos-1),numel(solution.Trips), ...
+                solution.Order(pos:end)];
+            return;
+        end
+    end
+    pick = test;
+end
+end
+
+function solution = tryModelRebalance(solution,data,base)
+% 优先从单位机队工作量最高的机型迁出整条可行架次。
+load = modelWorkload(solution,data,base);
+[~,g] = max(load.WorkPerDrone_s);
+fromModel = load.Model(g);
+idx = find([solution.Trips.Model] == fromModel);
+idx = idx(randperm(numel(idx)));
+for r = idx
+    trip = solution.Trips(r);
+    targets = setdiff(data.Models.Model,fromModel,'stable');
+    [~,order] = sort(load.WorkPerDrone_s(ismember(load.Model,targets)),'ascend');
+    targets = targets(order);
+    for m = targets.'
+        candidate = trip; candidate.Model = m;
+        if evaluateTrip(candidate,data,base).Feasible
+            solution.Trips(r) = candidate;
+            return;
+        end
+    end
+end
+end
+
+function solution = tryRouteNeighborhood(solution,data,base)
+idx = find(arrayfun(@(x)numel(x.Stops)>=2,solution.Trips));
+if isempty(idx), return; end
+r = idx(randi(numel(idx))); trip = solution.Trips(r);
+stops = trip.Stops;
+if rand < 0.5
+    stops = fliplr(stops);
+else
+    p = randperm(numel(stops),2); stops(p) = stops(fliplr(p));
+end
+candidate = trip; candidate.Stops = stops;
+if evaluateTrip(candidate,data,base).Feasible
+    solution.Trips(r) = candidate;
+end
+end
+
+function solution = tryCrossTripExchange(solution,data,base)
+if numel(solution.Trips) < 2, return; end
+p = randperm(numel(solution.Trips),2); a = solution.Trips(p(1)); b = solution.Trips(p(2));
+if isempty(a.BoxIdx) || isempty(b.BoxIdx), return; end
+ia = a.BoxIdx(randi(numel(a.BoxIdx))); ib = b.BoxIdx(randi(numel(b.BoxIdx)));
+a.BoxIdx(a.BoxIdx==ia) = ib; b.BoxIdx(b.BoxIdx==ib) = ia;
+a.Stops = stopsForBoxes(a.BoxIdx,a.Stops,data); b.Stops = stopsForBoxes(b.BoxIdx,b.Stops,data);
+if evaluateTrip(a,data,base).Feasible && evaluateTrip(b,data,base).Feasible
+    solution.Trips(p(1)) = a; solution.Trips(p(2)) = b;
+end
+end
+
+function stops = stopsForBoxes(boxIdx,oldStops,data)
+present = unique(data.Boxes.ServiceID(boxIdx),'stable');
+stops = oldStops(ismember(oldStops,present));
+missing = setdiff(present,stops,'stable');
+stops = [stops,missing.'];
+end
+
+function solution = perturbOrder(solution,data,base,profile)
+if isempty(solution.Trips), return; end
+if isempty(solution.Order) || numel(solution.Order) ~= numel(solution.Trips) || ...
+        ~isequal(sort(solution.Order),1:numel(solution.Trips))
+    solution.Order = initialScheduleOrder(solution,data,base,profile);
+end
+if numel(solution.Order) < 2, return; end
+if rand < 0.55
+    p = randperm(numel(solution.Order),2);
+    solution.Order(p) = solution.Order(fliplr(p));
+else
+    from = randi(numel(solution.Order)); to = randi(numel(solution.Order));
+    value = solution.Order(from); solution.Order(from) = [];
+    solution.Order = [solution.Order(1:to-1),value,solution.Order(to:end)];
+end
+end
+
+function order = initialScheduleOrder(solution,data,base,profile)
+% 硬时限架次优先；非紧急架次按时长降序以均衡并行机队。
+n = numel(solution.Trips); key = zeros(n,4);
+for r = 1:n
+    b = data.Boxes(solution.Trips(r).BoxIdx,:); hard = b.HardDeadline_s; hard(isnan(hard)) = inf;
+    duration = evaluateTrip(solution.Trips(r),data,base).Duration_s;
+    if profile == "timeliness", secondary = min(b.ExpectedDeadline_s); else, secondary = -duration; end
+    key(r,:) = [min(hard),secondary,-max(b.Priority),r];
+end
+[~,order] = sortrows(key,[1 2 3 4]); order = order.';
+end
+
+function solution = diversifyRestart(solution,archiveSolutions,archiveOutcomes, ...
+        data,base,profile,runKey)
+% 从当前档案的相应目标极值附近重新搜索，但每次尝试不同邻域。
+if ~isempty(archiveSolutions)
+    scores = zeros(1,numel(archiveOutcomes));
+    for k = 1:numel(scores)
+        scores(k) = scoreOutcome(archiveOutcomes{k},profile);
+    end
+    [~,idx] = min(scores);
+    solution = archiveSolutions{idx};
+end
+source = solution;
+operators = [9,10,11,5,6,7,1];
+for attempt = 1:numel(operators)
+    op = operators(mod(runKey+attempt-2,numel(operators))+1);
+    candidate = perturbSolution(source,data,base,op,profile);
+    if isequaln(candidate,source), continue; end
+    out = decodeSolution(candidate,data,base);
+    if out.Feasible
+        solution = candidate;
+        return;
+    end
+end
+end
+
+function idx = criticalTripIndices(solution,data,base)
+out = decodeSolution(solution,data,base);
+if isempty(out.Trips) || ~all(isfinite(out.Trips.Return_s))
+    idx = zeros(1,0);
+    return;
+end
+[~,last] = max(out.Trips.Return_s);
+droneID = out.Trips.DroneID(last);
+sameDrone = find(out.Trips.DroneID == droneID);
+[~,p] = sort(out.Trips.Return_s(sameDrone),'descend');
+idx = sameDrone(p(1:min(3,numel(p)))).';
+end
+
+function solution = improveCriticalOrder(solution,data,base,profile)
+critical = criticalTripIndices(solution,data,base);
+if isempty(critical), return; end
+best = solution;
+bestScore = inf;
+for r = critical(1:min(2,numel(critical)))
+    pos = find(solution.Order == r,1);
+    if isempty(pos), continue; end
+    targets = max(1,pos-5):min(numel(solution.Order),pos+1);
+    for target = targets
+        if target == pos, continue; end
+        trial = solution;
+        order = trial.Order;
+        order(pos) = [];
+        trial.Order = [order(1:target-1),r,order(target:end)];
+        out = decodeSolution(trial,data,base);
+        if out.Feasible
+            value = scoreOutcome(out,profile);
+            if value < bestScore
+                best = trial;
+                bestScore = value;
+            end
+        end
+    end
+end
+solution = best;
+end
+
+function solution = splitCriticalTrip(solution,data,base,profile)
+critical = criticalTripIndices(solution,data,base);
+if isempty(critical), return; end
+best = solution;
+bestScore = inf;
+fullDecodes = 0;
+for r = critical
+    trip = solution.Trips(r);
+    if numel(trip.BoxIdx) < 2, continue; end
+    b = trip.BoxIdx;
+    pairs = nchoosek(1:numel(b),2);
+    subsets = [num2cell(pairs,2);num2cell((1:numel(b)).')];
+    masses = cellfun(@(x)sum(data.Boxes.Mass_kg(b(x))),subsets);
+    [~,priority] = sort(masses,'descend');
+    for j = priority.'
+        move = b(subsets{j});
+        remaining = setdiff(b,move,'stable');
+        sourceTrip = trip;
+        sourceTrip.BoxIdx = remaining;
+        sourceTrip.Stops = stopsForBoxes(remaining,trip.Stops,data);
+        if ~evaluateTrip(sourceTrip,data,base).Feasible, continue; end
+        for model = ["B","A"]
+            newTrip = struct('BoxIdx',{move}, ...
+                'Stops',unique(data.Boxes.ServiceID(move),'stable').', ...
+                'Model',model);
+            if ~evaluateTrip(newTrip,data,base).Feasible, continue; end
+            trial = solution;
+            trial.Trips(r) = sourceTrip;
+            trial.Trips(end+1) = newTrip;
+            pos = find(trial.Order == r,1);
+            for insertAt = unique([1,pos])
+                candidate = trial;
+                candidate.Order = [trial.Order(1:insertAt-1), ...
+                    numel(trial.Trips),trial.Order(insertAt:end)];
+                out = decodeSolution(candidate,data,base);
+                fullDecodes = fullDecodes+1;
+                if out.Feasible
+                    value = scoreOutcome(out,profile);
+                    if value < bestScore
+                        best = candidate;
+                        bestScore = value;
+                    end
+                end
+                if fullDecodes >= 16, break; end
+            end
+            if fullDecodes >= 16, break; end
+        end
+        if fullDecodes >= 16, break; end
+    end
+    if fullDecodes >= 16, break; end
+end
+solution = best;
+end
+
+function solution = transferCriticalBox(solution,data,base,profile)
+critical = criticalTripIndices(solution,data,base);
+if isempty(critical), return; end
+best = solution;
+bestScore = inf;
+fullDecodes = 0;
+for r = critical
+    source = solution.Trips(r);
+    if numel(source.BoxIdx) < 2, continue; end
+    boxes = source.BoxIdx(randperm(numel(source.BoxIdx)));
+    for box = boxes
+        for target = randperm(numel(solution.Trips))
+            if target == r, continue; end
+            recipient = solution.Trips(target);
+            service = data.Boxes.ServiceID(box);
+            recipient.BoxIdx = [recipient.BoxIdx,box];
+            if ~any(recipient.Stops == service)
+                recipient.Stops = [recipient.Stops,service];
+            end
+            if ~evaluateTrip(recipient,data,base).Feasible, continue; end
+            remaining = setdiff(source.BoxIdx,box,'stable');
+            donor = source;
+            donor.BoxIdx = remaining;
+            donor.Stops = stopsForBoxes(remaining,source.Stops,data);
+            if ~evaluateTrip(donor,data,base).Feasible, continue; end
+            trial = solution;
+            trial.Trips(r) = donor;
+            trial.Trips(target) = recipient;
+            out = decodeSolution(trial,data,base);
+            fullDecodes = fullDecodes+1;
+            if out.Feasible
+                value = scoreOutcome(out,profile);
+                if value < bestScore
+                    best = trial;
+                    bestScore = value;
+                end
+            end
+            if fullDecodes >= 12, break; end
+        end
+        if fullDecodes >= 12, break; end
+    end
+    if fullDecodes >= 12, break; end
+end
+solution = best;
 end
 
 function solution = insertBoxGreedy(solution,boxIdx,data,base)
@@ -438,6 +1033,7 @@ if isempty(best)
 end
 if best.Index == 0
     solution.Trips(end+1) = best.Trip;
+    solution.Order = [solution.Order,numel(solution.Trips)];
 else
     solution.Trips(best.Index) = best.Trip;
 end
@@ -519,7 +1115,7 @@ if energy > (1-data.Models.ReserveRatio(g))*data.Models.BatteryUse_kWh(g)+1e-9
     tripCache(key) = info;
     return;
 end
-info.ChargeTime_s = problem2.chargeTime(info.ReturnSOC, ...
+info.ChargeTime_s = common.chargeTime(info.ReturnSOC, ...
     batteryFullTime(trip.Model,data));
 info.Feasible = all(isfinite(info.DeliveryOffset_s));
 tripCache(key) = info;
@@ -598,41 +1194,115 @@ outcome = struct('Feasible',feasible,'Trips',trips,'Deliveries',deliveries, ...
 end
 
 function solution = repairHardDeadlines(solution,data,base,config)
-for pass = 1:height(data.Boxes)
+for pass = 1:min(12,height(data.Boxes))
     out = decodeSolution(solution,data,base);
     lateMask = ~isnan(out.Deliveries.HardDeadline_s) & ...
         out.Deliveries.Delivery_s > out.Deliveries.HardDeadline_s+1e-7;
-    late = out.Deliveries.BoxID(lateMask);
-    if isempty(late), return; end
-    idx = find(data.Boxes.BoxID == late(1),1);
-    solution = removeBoxes(solution,idx,data);
-    best = [];
-    for g = 1:height(data.Models)
-        cand = struct('BoxIdx',idx,'Stops',data.Boxes.ServiceID(idx),'Model',data.Models.Model(g));
-        if evaluateTrip(cand,data,base).Feasible
-            best = cand; break;
+    if ~any(lateMask), return; end
+    lateness = out.Deliveries.Delivery_s-out.Deliveries.HardDeadline_s;
+    lateness(~lateMask) = -inf;
+    [~,lateRow] = max(lateness);
+    idx = find(data.Boxes.BoxID == out.Deliveries.BoxID(lateRow),1);
+    r = find(arrayfun(@(x)ismember(idx,x.BoxIdx),solution.Trips),1);
+    best = solution;
+    bestLate = hardLateness(out);
+
+    % 首先把超时架次提前，不改变货箱组批。
+    pos = find(solution.Order == r,1);
+    targets = unique([1,max(1,round(pos/2)),max(1,pos-1)]);
+    for target = targets(targets < pos)
+        trial = solution;
+        order = trial.Order;
+        order(pos) = [];
+        trial.Order = [order(1:target-1),r,order(target:end)];
+        value = hardLateness(decodeSolution(trial,data,base));
+        if value < bestLate-1e-7
+            best = trial;
+            bestLate = value;
         end
     end
-    if isempty(best), return; end
-    solution.Trips(end+1) = best;
-    solution.Order = urgencyOrder(solution,data);
+    if bestLate <= 1e-7
+        solution = best;
+        continue;
+    end
+
+    % 再尝试把超时货箱放入同服务区的其他架次。
+    reduced = removeBoxes(solution,idx,data);
+    service = data.Boxes.ServiceID(idx);
+    for target = 1:numel(reduced.Trips)
+        if ~any(reduced.Trips(target).Stops == service), continue; end
+        trial = reduced;
+        trip = trial.Trips(target);
+        trip.BoxIdx = [trip.BoxIdx,idx];
+        if ~evaluateTrip(trip,data,base).Feasible, continue; end
+        trial.Trips(target) = trip;
+        value = hardLateness(decodeSolution(trial,data,base));
+        if value < bestLate-1e-7
+            best = trial;
+            bestLate = value;
+        end
+    end
+
+    % 最后才拆出单箱架次，并挑选可行的早期派发位置。
+    if bestLate > 1e-7
+        for g = 1:height(data.Models)
+            trip = struct('BoxIdx',idx,'Stops',service,'Model',data.Models.Model(g));
+            if ~evaluateTrip(trip,data,base).Feasible, continue; end
+            trial = reduced;
+            trial.Trips(end+1) = trip;
+            targets = unique([1,min(3,numel(trial.Order)+1), ...
+                min(6,numel(trial.Order)+1)]);
+            for target = targets
+                candidate = trial;
+                candidate.Order = [trial.Order(1:target-1), ...
+                    numel(trial.Trips),trial.Order(target:end)];
+                value = hardLateness(decodeSolution(candidate,data,base));
+                if value < bestLate-1e-7
+                    best = candidate;
+                    bestLate = value;
+                end
+            end
+        end
+    end
+    if isequaln(best,solution), return; end
+    solution = best;
 end
 end
 
+function value = hardLateness(outcome)
+value = outcome.Violation;
+if ~isfinite(value), value = inf; end
+end
+
 function solution = removeBoxes(solution,boxIdx,data)
+keepTrip = true(1,numel(solution.Trips));
 for r = numel(solution.Trips):-1:1
     keep = ~ismember(solution.Trips(r).BoxIdx,boxIdx);
     solution.Trips(r).BoxIdx = solution.Trips(r).BoxIdx(keep);
     if isempty(solution.Trips(r).BoxIdx)
-        solution.Trips(r) = [];
+        keepTrip(r) = false;
     else
         presentServices = unique(data.Boxes.ServiceID(solution.Trips(r).BoxIdx),'stable');
         solution.Trips(r).Stops = solution.Trips(r).Stops( ...
             ismember(solution.Trips(r).Stops,presentServices));
     end
 end
+solution = retainTrips(solution,keepTrip);
 solution = normalizeTrips(solution);
-solution.Order = 1:numel(solution.Trips);
+end
+
+function solution = retainTrips(solution,keepTrip)
+% 删除架次时同步重映射派发顺序，保留其余架次的相对次序。
+n = numel(solution.Trips);
+oldOrder = solution.Order;
+if numel(oldOrder) ~= n || ~isequal(sort(oldOrder),1:n)
+    oldOrder = 1:n;
+end
+mapping = zeros(1,n);
+mapping(keepTrip) = 1:nnz(keepTrip);
+solution.Trips = solution.Trips(keepTrip);
+newOrder = mapping(oldOrder);
+solution.Order = newOrder(newOrder > 0);
 end
 
 function solution = normalizeTrips(solution)
@@ -654,45 +1324,67 @@ end
 order = order.';
 end
 
-function [solutions,outcomes,added] = updateArchive(solutions,outcomes,solution,outcome,maxSize)
-added = false;
-if ~outcome.Feasible, return; end
-obj = outcome.Objectives;
-remove = false(1,numel(outcomes));
-for k = 1:numel(outcomes)
-    old = outcomes{k}.Objectives;
-    if all(old <= obj+1e-9) && any(old < obj-1e-9), return; end
-    if all(abs(old-obj) <= 1e-9), return; end
-    if all(obj <= old+1e-9) && any(obj < old-1e-9), remove(k) = true; end
+function T = modelWorkload(solution,data,base)
+model = data.Models.Model;
+work = zeros(height(data.Models),1);
+for r = 1:numel(solution.Trips)
+    g = find(model == solution.Trips(r).Model,1);
+    if ~isempty(g), work(g) = work(g)+evaluateTrip(solution.Trips(r),data,base).Duration_s; end
 end
-solutions(remove) = []; outcomes(remove) = [];
-solutions{end+1} = solution; outcomes{end+1} = outcome; added = true;
-if numel(outcomes) > maxSize
-    obj = zeros(numel(outcomes),4);
-    for k = 1:numel(outcomes), obj(k,:) = outcomes{k}.Objectives; end
-    span = max(obj,[],1)-min(obj,[],1); span(span < 1e-12) = 1;
-    score = sum((obj-min(obj,[],1))./span,2);
-    [~,drop] = max(score); solutions(drop)=[]; outcomes(drop)=[];
+droneCount = zeros(height(data.Models),1);
+for g = 1:height(data.Models), droneCount(g) = nnz(data.Drones.Model == model(g)); end
+T = table(model,work,droneCount,work./droneCount, ...
+    'VariableNames',{'Model','Work_s','DroneCount','WorkPerDrone_s'});
+end
+
+function [best,count] = archiveSummary(outcomes)
+count = numel(outcomes); best = [inf,inf,inf,inf];
+for k = 1:count, best = min(best,outcomes{k}.Objectives); end
+end
+
+function representatives = buildRepresentatives(solutions,outcomes,indices,data,base)
+names = fieldnames(indices); representatives = struct();
+for k = 1:numel(names)
+    idx = indices.(names{k}); out = outcomes{idx}; sol = solutions{idx};
+    representatives.(names{k}) = struct('Solution',sol, ...
+        'Objectives',objectiveStruct(out.Objectives),'Trips',out.Trips, ...
+        'Deliveries',out.Deliveries,'DroneTimeline',out.DroneTimeline, ...
+        'BatteryTimeline',out.BatteryTimeline,'Validation',validateOutcome(sol,out,data,base), ...
+        'ParetoIndex',idx);
 end
 end
 
-function index = chooseKneePoint(outcomes)
+function indices = chooseRepresentatives(outcomes)
 obj = zeros(numel(outcomes),4);
 for k = 1:numel(outcomes), obj(k,:) = outcomes{k}.Objectives; end
 lo = min(obj,[],1); hi = max(obj,[],1); span = hi-lo; span(span < 1e-12)=1;
 z = (obj-lo)./span;
+indices = struct();
+indices.TimelinessFirst = representativeIndex(obj,z,1);
+indices.MakespanFirst = representativeIndex(obj,z,2);
+indices.EnergyFirst = representativeIndex(obj,z,3);
+indices.TripCountFirst = representativeIndex(obj,z,4);
 key = [max(z,[],2),sum(z,2),z];
-[~,index] = sortrows(key,1:size(key,2)); index = index(1);
+[~,ix] = sortrows(key,1:size(key,2)); indices.Balanced = ix(1);
 end
 
-function tf = acceptCandidate(current,candidate,temperature)
+function index = representativeIndex(obj,z,primary)
+% 主目标严格优先；仅在数值等价时以其余目标的最大归一化差距打破平局。
+tol = max(1e-9,1e-8*max(1,abs(min(obj(:,primary)))));
+pool = find(obj(:,primary) <= min(obj(:,primary))+tol);
+other = setdiff(1:4,primary,'stable');
+key = [max(z(pool,other),[],2),sum(z(pool,other),2),z(pool,other),pool];
+[~,p] = sortrows(key,1:size(key,2)); index = pool(p(1));
+end
+
+function tf = acceptCandidate(current,candidate,temperature,profile,worseCap)
 if candidate.Feasible && ~current.Feasible, tf = true; return; end
 if ~candidate.Feasible && current.Feasible, tf = false; return; end
-delta = scoreOutcome(candidate)-scoreOutcome(current);
-tf = delta <= 0 || rand < exp(-delta/max(temperature,1e-9));
+delta = scoreOutcome(candidate,profile)-scoreOutcome(current,profile);
+tf = delta <= 0 || rand < min(worseCap,exp(-delta/max(temperature,1e-9)));
 end
 
-function value = scoreOutcome(outcome)
+function value = scoreOutcome(outcome,profile)
 o = outcome.Objectives;
 % 四目标采用固定、可解释的参考尺度，避免原始秒/kWh/架次量纲让
 % 模拟退火退化为只接受改进的贪心过程。正式 Pareto 支配判断仍使用
@@ -702,7 +1394,15 @@ if ~outcome.Feasible
     return;
 end
 scale = [1,2e4,50,20];
-value = mean(o./scale);
+z = o./scale;
+switch profile
+    case "timeliness", weight = [0.70,0.12,0.10,0.08];
+    case "makespan", weight = [0.10,0.70,0.10,0.10];
+    case "energy", weight = [0.10,0.10,0.70,0.10];
+    case "trips", weight = [0.10,0.10,0.10,0.70];
+    otherwise, weight = [0.25,0.25,0.25,0.25];
+end
+value = sum(weight.*z);
 end
 
 function op = roulette(weights)
@@ -747,50 +1447,146 @@ end
 
 function files = exportResults(result,data,config)
 if ~exist(config.ResultDir,'dir'), mkdir(config.ResultDir); end
-submission = fullfile(config.ResultDir,'问题二_结果提交.xlsx');
 analysis = fullfile(config.ResultDir,'问题二_多目标调度分析.xlsx');
 archiveFile = fullfile(config.ResultDir,'问题二_Pareto完整档案.mat');
-copyfile(config.TemplateFile,submission,'f');
-trips = sortrows(result.Selected.Trips,{'Start_s','TripID'});
-officialTrip = trips(:,{'TripID','DroneID','Model','BatteryID','Start_s','Route','Return_s','Energy_kWh'});
-writetable(officialTrip,submission,'Sheet','Q2_运输架次','Range','A2','WriteVariableNames',false);
-delivery = sortrows(result.Selected.Deliveries,'BoxID');
-officialDelivery = delivery(:,{'BoxID','TripID','ServiceID','Delivery_s'});
-writetable(officialDelivery,submission,'Sheet','Q2_逐箱交付','Range','A2','WriteVariableNames',false);
+repNames = fieldnames(result.Representatives);
+submissionNames = ["及时性优先","完成时间优先","能耗优先","架次数优先","折中方案"];
+submissions = struct();
+for k = 1:numel(repNames)
+    file = fullfile(config.ResultDir,"问题二_结果提交_"+submissionNames(k)+".xlsx");
+    writeRepresentativeSubmission(result.Representatives.(repNames{k}),config.TemplateFile,file);
+    submissions.(repNames{k}) = file;
+end
 if isfile(analysis), delete(analysis); end
-summary = {'指标','数值';'及时性目标',result.Selected.Objectives.Timeliness; ...
-    '全部任务完成时间（s）',result.Selected.Objectives.Makespan_s; ...
-    '总能耗（kWh）',result.Selected.Objectives.Energy_kWh; ...
-    '架次数',result.Selected.Objectives.TripCount};
-writecell(summary,analysis,'Sheet','主方案','Range','A1');
-writetable(result.Selected.Trips,analysis,'Sheet','主方案','Range','A8');
+writetable(representativeSummary(result),analysis,'Sheet','代表方案汇总','Range','A1');
 writetable(result.ParetoFront,analysis,'Sheet','Pareto前沿','Range','A1');
 writetable(buildParetoTripTable(result),analysis,'Sheet','Pareto架次','Range','A1');
 writetable(buildParetoDeliveryTable(result),analysis,'Sheet','Pareto逐箱交付','Range','A1');
-writetable(result.Selected.Deliveries,analysis,'Sheet','逐箱交付','Range','A1');
-writetable(result.Selected.DroneTimeline,analysis,'Sheet','无人机时间线','Range','A1');
-writetable(result.Selected.BatteryTimeline,analysis,'Sheet','电池时间线','Range','A1');
-writetable(result.Validation,analysis,'Sheet','校核','Range','A1');
-writetable(result.RunLog,analysis,'Sheet','算法稳定性','Range','A1');
+writetable(buildRepresentativeTripTable(result),analysis,'Sheet','代表方案架次','Range','A1');
+writetable(buildRepresentativeDeliveryTable(result),analysis,'Sheet','代表方案逐箱交付','Range','A1');
+writetable(buildRepresentativeValidationTable(result),analysis,'Sheet','代表方案校核','Range','A1');
+writetable(result.RunLog,analysis,'Sheet','运行汇总','Range','A1');
+writetable(result.ConvergenceLog,analysis,'Sheet','收敛记录','Range','A1');
+writetable(result.OperatorDiagnostics,analysis,'Sheet','算子诊断','Range','A1');
+writetable(buildResourceBottleneckTable(result,data),analysis,'Sheet','资源瓶颈','Range','A1');
 diagnostics = {'指标','数值'; ...
     '质量容量简单下界（趟）',result.Diagnostics.MassLowerBound; ...
     '体积容量简单下界（趟）',result.Diagnostics.VolumeLowerBound; ...
     '问题一单点组批热启动（趟）',result.Diagnostics.PackingSeedTripCount; ...
-    '问题二平衡主方案（趟）',result.Diagnostics.SelectedTripCount; ...
-    '搜索总耗时上限（s）',config.TimeLimit_s};
+    '当前基线最快完成时间（s）',result.Diagnostics.BaselineMakespan_s; ...
+    '本次最快完成时间（s）',result.Diagnostics.BestMakespan_s; ...
+    '搜索总耗时上限（s）',config.TimeLimit_s; ...
+    '100 分钟挑战目标（s）',6000};
+warm = result.Diagnostics.WarmStart;
+if warm.Enabled
+    diagnostics = [diagnostics; { ...
+        '外部热启动已启用',true; ...
+        '外部架次文件',char(warm.TripFile); ...
+        '外部逐箱文件',char(warm.DeliveryFile); ...
+        '导入架次数',warm.ImportedTripCount; ...
+        '导入货箱数',warm.ImportedBoxCount; ...
+        '重排程初始解可行',warm.InitialFeasible; ...
+        '重排程初始及时性目标',warm.InitialObjectives.Timeliness; ...
+        '重排程初始完成时间（s）',warm.InitialObjectives.Makespan_s; ...
+        '重排程初始总能耗（kWh）',warm.InitialObjectives.Energy_kWh; ...
+        '重排程初始架次数',warm.InitialObjectives.TripCount; ...
+        '外部排程字段处理',char(warm.SchedulingFields)}];
+else
+    diagnostics = [diagnostics; {'外部热启动已启用',false}];
+end
 writecell(diagnostics,analysis,'Sheet','求解诊断','Range','A1');
+if warm.Enabled
+    writetable(warm.InitialValidation,analysis,'Sheet','外部热启动校核','Range','A1');
+end
 if config.ExportParetoArchive
     paretoArchive = struct('Config',result.Config, ...
         'ParetoFront',result.ParetoFront, ...
         'ParetoSolutions',{result.ParetoSolutions}, ...
-        'ParetoOutcomes',{result.ParetoOutcomes});
+        'ParetoOutcomes',{result.ParetoOutcomes}, ...
+        'WarmStartBaseline',result.WarmStartBaseline);
     save(archiveFile,'paretoArchive','-v7.3');
 else
     archiveFile = "";
 end
-exportFigures(result,data,config.ResultDir);
-files = struct('Submission',submission,'Analysis',analysis, ...
+files = struct('Submissions',submissions,'Analysis',analysis, ...
     'ParetoArchive',archiveFile);
+end
+
+function writeRepresentativeSubmission(rep,templateFile,submission)
+copied = false; message = '';
+for attempt = 1:3
+    [copied,message] = copyfile(templateFile,submission,'f');
+    if copied, break; end
+    pause(1);
+end
+if ~copied
+    error('无法复制提交模板到 %s：%s',submission,message);
+end
+trips = sortrows(rep.Trips,{'Start_s','TripID'});
+officialTrip = trips(:,{'TripID','DroneID','Model','BatteryID','Start_s','Route','Return_s','Energy_kWh'});
+writetable(officialTrip,submission,'Sheet','Q2_运输架次','Range','A2','WriteVariableNames',false);
+delivery = sortrows(rep.Deliveries,'BoxID');
+officialDelivery = delivery(:,{'BoxID','TripID','ServiceID','Delivery_s'});
+writetable(officialDelivery,submission,'Sheet','Q2_逐箱交付','Range','A2','WriteVariableNames',false);
+end
+
+function T = representativeSummary(result)
+names = fieldnames(result.Representatives); n = numel(names);
+label = strings(n,1); timeliness = zeros(n,1); makespan = zeros(n,1); energy = zeros(n,1); trips = zeros(n,1); index = zeros(n,1);
+for k = 1:n
+    r = result.Representatives.(names{k}); label(k) = string(names{k});
+    timeliness(k) = r.Objectives.Timeliness; makespan(k) = r.Objectives.Makespan_s;
+    energy(k) = r.Objectives.Energy_kWh; trips(k) = r.Objectives.TripCount; index(k) = r.ParetoIndex;
+end
+T = table(label,index,timeliness,makespan,energy,trips, ...
+    'VariableNames',{'Representative','ParetoIndex','Timeliness','Makespan_s','Energy_kWh','TripCount'});
+end
+
+function T = buildRepresentativeTripTable(result)
+names = fieldnames(result.Representatives); parts = cell(numel(names),1);
+for k = 1:numel(names)
+    x = result.Representatives.(names{k}).Trips; x.Representative = repmat(string(names{k}),height(x),1);
+    parts{k} = movevars(x,'Representative','Before',1);
+end
+T = vertcat(parts{:}); T = sortrows(T,{'Representative','Start_s','TripID'});
+end
+
+function T = buildRepresentativeDeliveryTable(result)
+names = fieldnames(result.Representatives); parts = cell(numel(names),1);
+for k = 1:numel(names)
+    x = result.Representatives.(names{k}).Deliveries; x.Representative = repmat(string(names{k}),height(x),1);
+    parts{k} = movevars(x,'Representative','Before',1);
+end
+T = vertcat(parts{:}); T = sortrows(T,{'Representative','Delivery_s','BoxID'});
+end
+
+function T = buildRepresentativeValidationTable(result)
+names = fieldnames(result.Representatives); parts = cell(numel(names),1);
+for k = 1:numel(names)
+    x = result.Representatives.(names{k}).Validation; x.Representative = repmat(string(names{k}),height(x),1);
+    parts{k} = movevars(x,'Representative','Before',1);
+end
+T = vertcat(parts{:});
+end
+
+function T = buildResourceBottleneckTable(result,data)
+names = fieldnames(result.Representatives); parts = cell(numel(names),1);
+for k = 1:numel(names)
+    rep = result.Representatives.(names{k}); makespan = rep.Objectives.Makespan_s;
+    rows = cell(height(data.Models),1);
+    for g = 1:height(data.Models)
+        model = data.Models.Model(g); trips = rep.Trips(rep.Trips.Model==model,:);
+        used = unique(trips.DroneID); duration = sum(trips.Return_s-trips.Start_s);
+        droneCount = nnz(data.Drones.Model==model); batteryWait = sum(max(0,trips.Start_s));
+        utilization = duration/max(eps,droneCount*makespan);
+        rows{g} = table(string(names{k}),model,height(trips),droneCount,numel(used), ...
+            duration,duration/droneCount,utilization,batteryWait, ...
+            'VariableNames',{'Representative','Model','TripCount','FleetSize','UsedDrones', ...
+            'TotalWork_s','WorkLowerBound_s','DroneUtilization','StartDelay_s'});
+    end
+    parts{k} = vertcat(rows{:});
+end
+T = vertcat(parts{:});
 end
 
 function T = buildParetoTripTable(result)
@@ -833,8 +1629,8 @@ if isempty(archiveOutcomes)
     checkpoint.ParetoTable = table();
     checkpoint.ParetoObjectives = zeros(0,4);
 else
-    checkpoint.ParetoTable = makeParetoTable(archiveOutcomes, ...
-        chooseKneePoint(archiveOutcomes));
+    repIndex = chooseRepresentatives(archiveOutcomes);
+    checkpoint.ParetoTable = makeParetoTable(archiveOutcomes,repIndex.Balanced);
     checkpoint.ParetoObjectives = zeros(numel(archiveOutcomes),4);
     for k = 1:numel(archiveOutcomes)
         checkpoint.ParetoObjectives(k,:) = archiveOutcomes{k}.Objectives;
@@ -844,60 +1640,6 @@ checkpoint.RunLog = runLog;
 checkpointFile = fullfile(config.CheckpointDir, ...
     sprintf('问题二_ALNS档案_run%02d.mat',runIdx));
 save(checkpointFile,'checkpoint','-v7.3');
-end
-
-function exportFigures(result,data,resultDir)
-figureDir = fullfile(resultDir,'问题二_图表');
-if ~exist(figureDir,'dir'), mkdir(figureDir); end
-try
-    trips = result.Selected.Trips;
-    f = figure('Visible','off','Color','w'); hold on;
-    plot(data.Nodes.Lon,data.Nodes.Lat,'k.','MarkerSize',14);
-    text(data.Nodes.Lon,data.Nodes.Lat,cellstr(data.Nodes.ID),'FontSize',7, ...
-        'VerticalAlignment','bottom');
-    colors = lines(max(1,height(trips)));
-    for r = 1:height(trips)
-        stops = split(string(trips.Route),'->');
-        ids = ["O01";stops;"O01"];
-        idx = arrayfun(@(x)find(data.Nodes.ID==x,1),ids);
-        plot(data.Nodes.Lon(idx),data.Nodes.Lat(idx),'-o','Color',colors(r,:), ...
-            'MarkerSize',3,'LineWidth',1);
-    end
-    xlabel('经度（°）'); ylabel('纬度（°）'); title('问题二主方案运输路线'); grid on;
-    exportgraphics(f,fullfile(figureDir,'运输路线.png'),'Resolution',180); close(f);
-
-    f = figure('Visible','off','Color','w');
-    drawTimeline(result.Selected.DroneTimeline,'DroneID','Start_s','End_s','无人机');
-    title('无人机任务甘特图'); xlabel('时间（s）');
-    exportgraphics(f,fullfile(figureDir,'无人机甘特图.png'),'Resolution',180); close(f);
-
-    f = figure('Visible','off','Color','w');
-    drawTimeline(result.Selected.BatteryTimeline,'BatteryID','TaskStart_s','Available_s','电池');
-    title('电池任务与充电甘特图'); xlabel('时间（s）');
-    exportgraphics(f,fullfile(figureDir,'电池甘特图.png'),'Resolution',180); close(f);
-
-    p = result.ParetoFront;
-    f = figure('Visible','off','Color','w');
-    scatter3(p.Makespan_s,p.Energy_kWh,p.TripCount,45,p.Timeliness,'filled');
-    colorbar; xlabel('完成时间（s）'); ylabel('总能耗（kWh）'); zlabel('架次数');
-    title('问题二 Pareto 前沿（颜色为及时性目标）'); grid on;
-    exportgraphics(f,fullfile(figureDir,'Pareto前沿.png'),'Resolution',180); close(f);
-catch ME
-    warning('问题二图表导出失败：%s',ME.message);
-end
-end
-
-function drawTimeline(T,idVar,startVar,endVar,label)
-ids = unique(T.(idVar),'stable'); hold on;
-for k = 1:numel(ids)
-    rows = T(T.(idVar)==ids(k),:);
-    for r = 1:height(rows)
-        rectangle('Position',[rows.(startVar)(r),k-0.35, ...
-            rows.(endVar)(r)-rows.(startVar)(r),0.7], ...
-            'FaceColor',[0.25 0.55 0.85],'EdgeColor','none');
-    end
-end
-yticks(1:numel(ids)); yticklabels(cellstr(ids)); ylabel(label); grid on;
 end
 
 function T = makeParetoTable(outcomes,selected)

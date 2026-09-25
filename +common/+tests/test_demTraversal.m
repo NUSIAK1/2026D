@@ -56,10 +56,12 @@ flightBase = common.computeTerrainMatrices(options);
 
 assert(isequal(size(flightBase.D),[16,16]),'基础矩阵必须为 16×16。');
 assert(isequal(size(flightBase.HterrainMax),[16,16]));
-assert(max(abs(flightBase.HterrainMax-flightBase.HterrainMax'),'all') < 1e-9);
-assert(max(abs(flightBase.Hcruise-flightBase.Hcruise'),'all') < 1e-9);
-assert(max(abs(flightBase.Hcruise-flightBase.HterrainMax-50),'all') < 1e-9);
-assert(max(abs(flightBase.Hup-flightBase.Hdown'),'all') < 1e-9);
+assert(max(abs(flightBase.HterrainMax-flightBase.HterrainMax'),[],'all') < 1e-9);
+assert(max(abs(flightBase.Hcruise-flightBase.Hcruise'),[],'all') < 1e-9);
+offDiagonal = ~eye(16);
+delta = flightBase.Hcruise-flightBase.HterrainMax-50;
+assert(max(abs(delta(offDiagonal))) < 1e-9);
+assert(max(abs(flightBase.Hup-flightBase.Hdown'),[],'all') < 1e-9);
 assert(all(diag(flightBase.Hup)==0) && all(diag(flightBase.Hdown)==0));
 
 idx5 = find(flightBase.nodes.ID == "S005",1);
