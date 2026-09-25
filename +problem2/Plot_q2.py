@@ -24,7 +24,7 @@ excel_path = project_root / "结果" / f"问题二_结果提交_{scheme_suffix[s
 sheet_name = "Q2_运输架次"
 
 # 图片保存位置
-output_path = project_root / "论文" / "图表" / "问题二" / "无人机甘特图.png"
+output_path = project_root / "论文" / "图表" / "问题二" / f"无人机甘特图_{scheme_suffix[selected]}.png"
 output_path.parent.mkdir(parents=True, exist_ok=True)
 
 # 首批硬时限，单位：小时
@@ -336,10 +336,10 @@ plt.savefig(
     dpi=400,
     bbox_inches="tight"
 )
-plt.savefig(
-    output_path.with_suffix(".pdf"),
-    bbox_inches="tight"
-)
+# plt.savefig(
+#     output_path.with_suffix(".pdf"),
+#     bbox_inches="tight"
+# )
 
 plt.show()
 
