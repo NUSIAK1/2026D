@@ -81,6 +81,13 @@ resultQ2 = problem2.run_problem2(q2Config);
 完整 Pareto 档案同时写入 `问题二_Pareto完整档案.mat`，可通过
 `ExportParetoArchive=false` 关闭。
 
+## 问题二的独立增量优化
+
+使用 `problem2.run_optimization()` 从现有完整 Pareto 档案继续搜索，默认预算为 3600 秒。
+每次输出到 `结果/问题二_优化实验/` 下的全新目录，不覆盖旧解或下游问题三、四的输入。
+本入口使用八类算子、按耗时更新选择权重，并逐一检查新档案对旧档案的覆盖。
+详细依据、算子说明和验证口径见 `+problem2/优化方案.md`。
+
 ## 问题三联合调度
 
 `problem3.run_problem3(config)` 从原始表、DEM 和 `flightBase.mat` 读取物理参数；

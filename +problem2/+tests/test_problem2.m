@@ -34,6 +34,11 @@ assert(numel(unique(result.ConvergenceLog.Profile)) == 5, ...
     '五种目标偏好均应获得搜索时间。');
 assert(sum(result.OperatorDiagnostics.Candidates) == height(result.ConvergenceLog), ...
     '算子候选统计须覆盖全部迭代。');
+assert(height(result.OperatorDiagnostics)==8,'问题二应使用八类职责明确的算子。');
+assert(all(result.OperatorDiagnostics.Accepted <= ...
+    result.OperatorDiagnostics.Candidates-result.OperatorDiagnostics.Unchanged), ...
+    '无变化候选不能计入接受次数。');
+assert(all(result.OperatorDiagnostics.Elapsed_s >= 0),'算子耗时不能为负。');
 assert(all(abs(result.OperatorDiagnostics.AcceptanceRate- ...
     result.OperatorDiagnostics.Accepted./max(result.OperatorDiagnostics.Candidates,1)) < 1e-12), ...
     '算子接受率必须与候选数、接受数一致。');
@@ -66,6 +71,35 @@ catch ME
     failed = contains(string(ME.message),"必须同时提供");
 end
 assert(failed,'外部热启动缺少逐箱文件时必须报错。');
+
+% 已有档案作为只读回归样本：逐架次/逐箱数值完全一致，且所有旧权衡均保留。
+archiveFile = fullfile(paths.ResultDir,'问题二_Pareto完整档案.mat');
+if isfile(archiveFile)
+    seededConfig = config;
+    seededConfig.SeedArchiveFile = archiveFile;
+    seededConfig.ArchiveSize = inf;
+    seededConfig.NumRuns = 1;
+    seededConfig.MaxIterations = 2;
+    seeded = problem2.solveProblem2(seededConfig);
+    old = load(archiveFile,'paretoArchive');
+    assert(height(seeded.SeedDiagnostics)==numel(old.paretoArchive.ParetoSolutions));
+    assert(abs(seeded.Config.BaselineMakespan_s-min(seeded.SeedDiagnostics.Makespan_s))<1e-7, ...
+        '档案热启动的对照时间必须来自实际档案。');
+    diagnosticFile = [tempname,'.xlsx'];
+    cleanupDiagnostic = onCleanup(@()delete(diagnosticFile));
+    problem2.writeDiagnostics(seeded,diagnosticFile);
+    diagnostic = readcell(diagnosticFile,'Sheet','求解诊断');
+    assert(string(diagnostic{5,1})=="初始档案最快完成时间（s）");
+    assert(abs(diagnostic{5,2}-min(seeded.SeedDiagnostics.Makespan_s))<1e-7);
+    clear cleanupDiagnostic;
+    newObjectives = [seeded.ParetoFront.Timeliness,seeded.ParetoFront.Makespan_s, ...
+        seeded.ParetoFront.Energy_kWh,seeded.ParetoFront.TripCount];
+    for k = 1:numel(old.paretoArchive.ParetoOutcomes)
+        objective = old.paretoArchive.ParetoOutcomes{k}.Objectives;
+        assert(any(all(newObjectives <= objective+1e-9,2)), ...
+            '继承档案时不能丢失旧解权衡区域。');
+    end
+end
 fprintf('问题二测试全部通过。\n');
 end
 

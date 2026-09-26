@@ -14,7 +14,7 @@ for k = 1:numel(names)
     fprintf('%s：及时性 %.9f | 完成时间 %.3f s | 能耗 %.6f kWh | 架次 %d\n', ...
         names{k},x.Timeliness,x.Makespan_s,x.Energy_kWh,x.TripCount);
 end
-fprintf('Pareto 方案数：%d\n', numel(resultQ2.ParetoFront));
+fprintf('Pareto 方案数：%d\n', height(resultQ2.ParetoFront));
 
 for k = 1:numel(names)
     if ~all(resultQ2.Representatives.(names{k}).Validation.Passed)
