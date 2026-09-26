@@ -1,4 +1,4 @@
-function test_problem2()
+function test_problem2(flightBaseFile)
 %TEST_PROBLEM2 问题二的充电模型、热启动和全数据快速回归测试。
 
 assert(abs(common.chargeTime(0,100)-100) < 1e-10);
@@ -8,12 +8,14 @@ assert(abs(common.chargeTime(0.9-1e-9,100)-35) < 1e-6);
 testParetoArchive();
 
 paths = common.projectPaths();
+if nargin < 1, flightBaseFile = paths.FlightBaseFile; end
 assert(isfile(paths.DemandFile),'未定位到问题二需求文件。');
-assert(isfile(paths.FlightBaseFile),'未定位到飞行基础缓存。');
+assert(isfile(flightBaseFile),'未定位到飞行基础缓存。');
 
 config = struct('ExportFiles',false,'SaveRunArchive',false, ...
     'ProgressEnabled',false,'NumRuns',5,'MaxIterations',8, ...
     'TimeLimit_s',120,'StagnationLimit',8,'ArchiveSize',20,'Verbose',false);
+config.FlightBaseFile = flightBaseFile;
 result = problem2.solveProblem2(config);
 names = {'TimelinessFirst','MakespanFirst','EnergyFirst','TripCountFirst','Balanced'};
 for k = 1:numel(names)
@@ -39,6 +41,11 @@ assert(all(result.OperatorDiagnostics.Accepted <= ...
     result.OperatorDiagnostics.Candidates-result.OperatorDiagnostics.Unchanged), ...
     '无变化候选不能计入接受次数。');
 assert(all(result.OperatorDiagnostics.Elapsed_s >= 0),'算子耗时不能为负。');
+assert(all(result.OperatorDiagnostics.InternalAdded <= result.OperatorDiagnostics.InternalFeasible) && ...
+    all(result.OperatorDiagnostics.InternalFeasible <= result.OperatorDiagnostics.InternalEvaluated), ...
+    '内部候选入档、可行和完整评价计数必须一致。');
+assert(sum(result.OperatorDiagnostics.InternalEvaluated) > 0, ...
+    '回归测试必须覆盖内部候选入档回调。');
 assert(all(abs(result.OperatorDiagnostics.AcceptanceRate- ...
     result.OperatorDiagnostics.Accepted./max(result.OperatorDiagnostics.Candidates,1)) < 1e-12), ...
     '算子接受率必须与候选数、接受数一致。');
@@ -72,9 +79,13 @@ catch ME
 end
 assert(failed,'外部热启动缺少逐箱文件时必须报错。');
 
-% 已有档案作为只读回归样本：逐架次/逐箱数值完全一致，且所有旧权衡均保留。
-archiveFile = fullfile(paths.ResultDir,'问题二_Pareto完整档案.mat');
-if isfile(archiveFile)
+% 使用同一输入刚生成的档案测试热启动，避免把历史地形差异误判为代码回归。
+% 用户指定的历史档案仍由正式入口逐一严格校核，不能跳过该校核。
+archiveFile = [tempname,'.mat'];
+cleanupArchive = onCleanup(@()delete(archiveFile)); %#ok<NASGU>
+paretoArchive = struct('ParetoSolutions',{result.ParetoSolutions}, ...
+    'ParetoOutcomes',{result.ParetoOutcomes});
+save(archiveFile,'paretoArchive');
     seededConfig = config;
     seededConfig.SeedArchiveFile = archiveFile;
     seededConfig.ArchiveSize = inf;
@@ -99,7 +110,28 @@ if isfile(archiveFile)
         assert(any(all(newObjectives <= objective+1e-9,2)), ...
             '继承档案时不能丢失旧解权衡区域。');
     end
+% 模拟历史目标失配：严格模式必须拒绝，显式重算模式必须恢复当前真实目标。
+for k = 1:numel(paretoArchive.ParetoOutcomes)
+    paretoArchive.ParetoOutcomes{k}.Objectives = ...
+        paretoArchive.ParetoOutcomes{k}.Objectives+[0,1,1,0];
 end
+save(archiveFile,'paretoArchive');
+failed = false;
+try
+    problem2.solveProblem2(seededConfig);
+catch ME
+    failed = contains(string(ME.message),"重算目标不一致");
+end
+assert(failed,'严格模式必须拒绝目标失配。');
+seededConfig.SeedEvaluationMode = "recompute";
+recomputed = problem2.solveProblem2(seededConfig);
+assert(all(recomputed.SeedReevaluation.Feasible),'同输入的旧方案应全部可行。');
+assert(max(abs(recomputed.SeedReevaluation.ObjectiveDelta- ...
+    repmat([0,-1,-1,0],height(recomputed.SeedReevaluation),1)),[],'all') < 1e-7, ...
+    '重算模式必须使用解码目标，不能沿用历史目标。');
+assert(max(abs(table2array(recomputed.SeedDiagnostics)- ...
+    table2array(seeded.SeedDiagnostics)),[],'all') < 1e-7, ...
+    '重算基线与同输入严格校核基线应一致。');
 fprintf('问题二测试全部通过。\n');
 end
 

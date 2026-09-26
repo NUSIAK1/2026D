@@ -9,6 +9,7 @@ function flightBase = computeTerrainMatrices(options)
 %   NodeFile             节点数据路径
 %   TransportUavFile     运输无人机数据路径
 %   DemFile              DEM MAT 数据路径
+%   ControlPointFile     含 O01、S001--S015 实测高程的节点文件
 %
 % 返回值 flightBase 与保存到 MAT 文件的主要字段一致。
 %
@@ -137,37 +138,14 @@ disp(uav);
 %% ========================================================================
 % 4. 读取 DEM
 % ========================================================================
-DEMdata = load(demFile);
-
-requiredVars = {'dem','latitude','longitude','nodata','epsg_code','transform'};
-for k = 1:numel(requiredVars)
-    if ~isfield(DEMdata, requiredVars{k})
-        error('DEM MAT 文件缺少变量：%s', requiredVars{k});
-    end
-end
-
-Z         = double(DEMdata.dem);
-latVec    = double(DEMdata.latitude(:));
-lonVec    = double(DEMdata.longitude(:)).';
-nodataVal = double(DEMdata.nodata(1));
-epsgCode  = double(DEMdata.epsg_code(1));
-transform = double(DEMdata.transform(:)).';
-
-Z(Z == nodataVal) = NaN;
-
+dem = common.loadCoreg3CMDem(demFile,options.ControlPointFile);
+Z = dem.Z;
+latVec = dem.Lat;
+lonVec = dem.Lon;
+nodataVal = dem.nodataVal;
+epsgCode = dem.epsgCode;
+transform = dem.transform;
 [nRow,nCol] = size(Z);
-
-if numel(latVec) ~= nRow, error('latitude 数量与 dem 行数不一致。'); end
-if numel(lonVec) ~= nCol, error('longitude 数量与 dem 列数不一致。'); end
-
-if latVec(1) > latVec(end)
-    latVec = flipud(latVec);
-    Z      = flipud(Z);
-end
-if lonVec(1) > lonVec(end)
-    lonVec = fliplr(lonVec);
-    Z      = fliplr(Z);
-end
 
 lonStep = median(diff(lonVec));
 latStep = median(diff(latVec));
@@ -187,7 +165,10 @@ if any(nodeCols < 0.5-1e-9 | nodeCols > nCol+0.5+1e-9 | ...
     error('节点 %s 超出 DEM 范围。',nodes.ID(bad));
 end
 
-fprintf('\nDEM读取完成：%d × %d 像元，EPSG=%d\n', nRow, nCol, epsgCode);
+fprintf('\nCoreg3CM 校正完成：DX=%.3f m，DY=%.3f m，DZ=%.3f m，拟合/校正后 RMSE=%.3f/%.3f m\n', ...
+    dem.Coreg3CM.DX_m,dem.Coreg3CM.DY_m,dem.Coreg3CM.DZ_m, ...
+    dem.Coreg3CM.RMSE_m,dem.Coreg3CM.PostRMSE_m);
+fprintf('校正后 DEM：%d × %d 像元，EPSG=%d\n', nRow, nCol, epsgCode);
 fprintf('经度范围：%.8f° ~ %.8f°\n', min(lonVec), max(lonVec));
 fprintf('纬度范围：%.8f° ~ %.8f°\n', min(latVec), max(latVec));
 fprintf('有效高程范围：%.3f m ~ %.3f m\n', ...
@@ -288,7 +269,7 @@ if ~isempty(baseMatDir) && ~isfolder(baseMatDir)
 end
 save(baseMatFile, 'nodes', 'uav', ...
      'D', 'HterrainMax', 'Hcruise', 'Hup', 'Hdown', ...
-     'epsgCode', 'nodataVal', 'transform', 'demFile');
+     'epsgCode', 'nodataVal', 'transform', 'demFile', 'dem');
 fprintf('\n基础数据已保存到：%s\n', baseMatFile);
 
 %% ========================================================================
@@ -348,6 +329,13 @@ if writeResultXlsx
         'EPSG',     epsgCode;
         'NoData',   nodataVal;
         'Transform', mat2str(transform,12);
+        'DEM correction','Coreg3CM: horizontal resampling plus vertical offset';
+        'Control point file',char(dem.ControlPointFile);
+        'DX_m',dem.Coreg3CM.DX_m;
+        'DY_m',dem.Coreg3CM.DY_m;
+        'DZ_m',dem.Coreg3CM.DZ_m;
+        'Control point RMSE_m',dem.Coreg3CM.RMSE_m;
+        'Post-correction RMSE_m',dem.Coreg3CM.PostRMSE_m;
         'DEM traversal','Amanatides-Woo 2D closed supercover'
         };
     writecell(meta, resultFile, 'Sheet', 'Metadata');
@@ -367,6 +355,7 @@ flightBase.epsgCode = epsgCode;
 flightBase.nodataVal = nodataVal;
 flightBase.transform = transform;
 flightBase.demFile = demFile;
+flightBase.dem = dem;
 end
 
 function options = applyDefaults(options)
@@ -384,7 +373,8 @@ defaults = struct( ...
     'ResultFile',paths.TerrainResultFile, ...
     'NodeFile',paths.NodeFile, ...
     'TransportUavFile',paths.TransportUavFile, ...
-    'DemFile',paths.DemFile);
+    'DemFile',paths.DemFile, ...
+    'ControlPointFile',paths.NodeFile);
 
 names = fieldnames(defaults);
 for k = 1:numel(names)

@@ -12,6 +12,7 @@ end
 rows=cell(0,1); failure=struct('TripID',"",'Start_s',NaN,'End_s',NaN, ...
     'Phase',"",'Reason',"");
 for i=1:numel(transport.Phases)
+    problem3.checkDeadline(config);
     p=transport.Phases(i);
     breaks=[p.Start_s;p.End_s];
     for j=1:height(relayTrips)

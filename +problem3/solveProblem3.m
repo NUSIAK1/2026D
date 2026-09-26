@@ -2,19 +2,54 @@ function result = solveProblem3(config)
 %SOLVEPROBLEM3 五目标联合 ALNS、连续通信认证和正式结果生成。
 if nargin<1, config=struct(); end
 config=defaults(config);
+clock=tic;
+config.DeadlineClock=clock; config.DeadlineSeconds=config.TimeLimit_s;
 data=problem3.loadData(config);
 seeds=problem3.loadSeeds(config,data);
 rng(config.RandomSeed,'twister');
 archiveSolutions={}; archiveOutcomes={};
+baselineObjectives=zeros(0,5);
 runRows=cell(0,1);
 operatorRows=cell(0,1);
-clock=tic;
+try
+% 旧问题三只作为热启动；按本轮物理数据重新解码并重新认证，不能直接信任旧目标值。
+if strlength(string(config.SeedQ3ArchiveFile))>0 && isfile(config.SeedQ3ArchiveFile)
+    old=load(config.SeedQ3ArchiveFile,'saved');
+    if isfield(old,'saved') && isfield(old.saved,'ParetoSolutions')
+        for k=1:numel(old.saved.ParetoSolutions)
+            problem3.checkDeadline(config);
+            prev=old.saved.ParetoSolutions{k};
+            tr=problem3.decodeTransport(prev.Solution,data);
+            if ~tr.Feasible, continue; end
+            % 即使旧中继位置已不适用于新 DEM，其运输时序仍可供重新规划中继。
+            warmSeed=prev.Solution;
+            warmSeed.Source="旧问题三运输时序";
+            seeds{end+1}=warmSeed; %#ok<AGROW>
+            refreshed=problem3.recomputeRelay(prev.Relay,data);
+            [rp,oc]=certifiedCandidate(prev.Solution,tr,refreshed,data,config);
+            if oc.Feasible
+                [archiveSolutions,archiveOutcomes,~]=problem3.updateParetoArchive( ...
+                    archiveSolutions,archiveOutcomes,rp,oc,config.ArchiveSize);
+                saveCheckpoint(config,archiveSolutions,archiveOutcomes,runRows,operatorRows);
+            end
+        end
+        for k=1:numel(archiveOutcomes)
+            baselineObjectives(end+1,:)=archiveOutcomes{k}.Objectives; %#ok<AGROW>
+        end
+        fprintf('[Q3] 旧问题三经本轮数据重新认证，保留 %d 个非支配方案。\n',numel(archiveOutcomes));
+    end
+end
 for run=1:config.NumRuns
     if toc(clock)>=config.TimeLimit_s, break; end
     runClock=tic;
     runBudget_s=max(0,(config.TimeLimit_s-toc(clock))/(config.NumRuns-run+1));
     rng(config.RandomSeed+run-1,'twister');
     seed=seeds{mod(run-1,numel(seeds))+1};
+    % 从已认证前沿重启，避免所有预算重复花在不可行的初始排程上。
+    if mod(run,3)==0 && ~isempty(archiveSolutions)
+        seed=archiveSolutions{randi(numel(archiveSolutions))}.Solution;
+    end
+    config.RelaySelectionProfile=mod(run-1,3)+1;
     if config.Verbose
         fprintf('[Q3] 运行 %d/%d，初始来源 %s。\n',run,config.NumRuns,seed.Source);
     end
@@ -24,16 +59,19 @@ for run=1:config.NumRuns
             "运输初始解不可行："+transport.Failure); %#ok<AGROW>
         continue;
     end
-    relay=problem3.planRelay(transport,data,config);
+    relay=problem3.planCertifiedRelay(transport,data,config);
     pre=relay.Precompute;
     [rep,outcome]=certifiedCandidate(seed,transport,relay,data,config);
     if outcome.Feasible
         [archiveSolutions,archiveOutcomes,~]=problem3.updateParetoArchive( ...
             archiveSolutions,archiveOutcomes,rep,outcome,config.ArchiveSize);
+        saveCheckpoint(config,archiveSolutions,archiveOutcomes,runRows,operatorRows);
     else
+        if config.Verbose, fprintf('[Q3] 初始联合方案待修复：%s\n',relay.Failure); end
         searchConfig=config;
+        searchConfig.RelayPrecompute=pre;
         searchConfig.TimingIterations=min(config.MaxIterations,1200);
-        searchConfig.TimeLimit_s=min(180,max(0,runBudget_s-toc(runClock)));
+        searchConfig.TimeLimit_s=max(0,runBudget_s-toc(runClock));
         q=problem3.searchTiming(seed,data,searchConfig);
         if q.Feasible
             seed=q.Solution; transport=q.Transport; relay=q.Relay;
@@ -42,7 +80,12 @@ for run=1:config.NumRuns
             if outcome.Feasible
                 [archiveSolutions,archiveOutcomes,~]=problem3.updateParetoArchive( ...
                     archiveSolutions,archiveOutcomes,rep,outcome,config.ArchiveSize);
+                saveCheckpoint(config,archiveSolutions,archiveOutcomes,runRows,operatorRows);
             end
+        elseif isfield(q,'Solution') && ~isequaln(q.Solution,seed)
+            resumeSeed=q.Solution;
+            resumeSeed.Source=seed.Source+"（继续修复）";
+            seeds{end+1}=resumeSeed; %#ok<AGROW>
         end
     end
     if ~outcome.Feasible
@@ -70,6 +113,9 @@ for run=1:config.NumRuns
         op=roulette(operatorWeights);
         operatorAttempts(op)=operatorAttempts(op)+1;
         [candidate,geometryChanged]=problem3.perturbSolution(current,data,critical,op);
+        if isequaln(candidate,current)
+            stagnant=stagnant+1; continue;
+        end
         candT=problem3.decodeTransport(candidate,data);
         if ~candT.Feasible
             operatorWeights(op)=adapt(operatorWeights(op),operatorBase(op),0);
@@ -77,7 +123,7 @@ for run=1:config.NumRuns
         end
         trialConfig=config;
         if ~geometryChanged, trialConfig.RelayPrecompute=currentPre; end
-        candR=problem3.planRelay(candT,data,trialConfig);
+        candR=problem3.planCertifiedRelay(candT,data,trialConfig);
         if ~candR.Feasible
             operatorWeights(op)=adapt(operatorWeights(op),operatorBase(op),0);
             stagnant=stagnant+1; continue;
@@ -91,6 +137,7 @@ for run=1:config.NumRuns
         [archiveSolutions,archiveOutcomes,status]=problem3.updateParetoArchive( ...
             archiveSolutions,archiveOutcomes,candRep,candOutcome,config.ArchiveSize);
         if status=="added"
+            saveCheckpoint(config,archiveSolutions,archiveOutcomes,runRows,operatorRows);
             stagnant=0; operatorAdded(op)=operatorAdded(op)+1;
             operatorWeights(op)=adapt(operatorWeights(op),operatorBase(op),3);
         else
@@ -100,7 +147,7 @@ for run=1:config.NumRuns
         profile=mod(run-1,6)+1;
         oldScore=weighted(currentObj,profile);
         newScore=weighted(candOutcome.Objectives,profile);
-        temp=max(0.002,0.04*(1-it/config.MaxIterations));
+        temp=max(0.002,0.04*(1-toc(runClock)/max(1,runBudget_s)));
         if newScore<=oldScore || rand<min(0.15,exp((oldScore-newScore)/temp))
             current=candidate; currentRep=candRep;
             currentObj=candOutcome.Objectives;
@@ -121,9 +168,18 @@ for run=1:config.NumRuns
             'ArchiveAdded','FinalWeight'}); %#ok<AGROW>
     end
 end
+catch ME
+    if strcmp(ME.identifier,'problem3:TimeLimit')
+        fprintf('[Q3] 搜索预算结束，导出 %d 个已认证方案。\n',numel(archiveOutcomes));
+    else
+        rethrow(ME);
+    end
+end
+config=rmfield(config,{'DeadlineClock','DeadlineSeconds'});
 result=struct('Config',config,'ParetoSolutions',{archiveSolutions}, ...
     'ParetoOutcomes',{archiveOutcomes},'RunLog',table(),'OperatorLog',table(), ...
     'ParetoFront',table(),'Representatives',struct(),'OutputFiles',struct());
+result.BaselineObjectives=baselineObjectives;
 if ~isempty(runRows), result.RunLog=vertcat(runRows{:}); end
 if ~isempty(operatorRows), result.OperatorLog=vertcat(operatorRows{:}); end
 if isempty(archiveOutcomes)
@@ -153,7 +209,8 @@ d=struct('FlightBaseFile',p.FlightBaseFile,'DemandFile',p.DemandFile, ...
     'RandomSeed',2026,'NumRuns',10,'MaxIterations',2500, ...
     'TimeLimit_s',3600,'StagnationLimit',800,'ArchiveSize',200, ...
     'CommMaxDepth',30,'CommMinInterval_s',0.001, ...
-    'GapSampleStep_s',45,'RelayBeamWidth',36, ...
+    'GapSampleStep_s',1,'RelayBeamWidth',36, ...
+    'MaxCoverageRepairs',4,'SeedQ3ArchiveFile',"",'CheckpointDir',"", ...
     'ExportFiles',true,'ExportFigures',true,'ProgressEvery',100, ...
     'Verbose',true);
 fields=fieldnames(d);
@@ -168,16 +225,26 @@ function [rep,outcome]=certifiedCandidate(solution,T,R,data,config)
 outcome=struct('Feasible',false,'Objectives',inf(1,5));
 rep=struct();
 if ~R.Feasible, return; end
-cert=problem3.certifyCoverage(T,R.RelayTrips,data,config);
-if ~cert.Feasible, return; end
 R=rmfield(R,intersect(fieldnames(R), ...
     {'Precompute','CandidatePoints','Capability','Gaps'}));
 rep=struct('Solution',solution,'Transport',T,'Relay',R, ...
-    'Coverage',cert.Coverage);
+    'Coverage',table());
 val=problem3.validateProblem3(rep,data,config);
 if ~val.Feasible, return; end
+rep.Coverage=val.Coverage;
 rep.Validation=val;
 outcome=struct('Feasible',true,'Objectives',val.Objectives);
+end
+
+function saveCheckpoint(config,solutions,outcomes,runRows,operatorRows)
+if strlength(string(config.CheckpointDir))==0 || isempty(outcomes), return; end
+if ~isfolder(config.CheckpointDir), mkdir(config.CheckpointDir); end
+c=rmfield(config,{'DeadlineClock','DeadlineSeconds'});
+saved=struct('Config',c,'ParetoSolutions',{solutions},'ParetoOutcomes',{outcomes}, ...
+    'RunRows',{runRows},'OperatorRows',{operatorRows});
+temporary=fullfile(config.CheckpointDir,'pending.mat');
+save(temporary,'saved','-v7.3');
+movefile(temporary,fullfile(config.CheckpointDir,'最新已认证档案.mat'),'f');
 end
 
 function s=weighted(x,profile)

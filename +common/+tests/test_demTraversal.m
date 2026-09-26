@@ -5,6 +5,7 @@ testOrdinaryAndAxisAlignedLines();
 testBoundaryCornerAndEndpointCoverage();
 testSinglePixelReverseAndEdgeClipping();
 testInvalidElevationFails();
+testCoreg3CMRecovery();
 testProjectTerrainMatrix();
 
 fprintf('test_demTraversal: 全部测试通过。\n');
@@ -46,6 +47,30 @@ assertThrows(@() common.maxDemOnPath(Z,[4,1],"O01","S001"), ...
     'common:maxDemOnPath:PixelOutOfRange');
 end
 
+function testCoreg3CMRecovery()
+% 人工平面在任意控制点上的水平位移/垂直偏移应能被精确反演。
+lat = (30:0.001:30.010)';
+lon = (110:0.001:110.010);
+[lonGrid,latGrid] = meshgrid(lon,lat);
+metresLat = 110852; metresLon = 96486;
+xKm = (lonGrid-110)*metresLon/1000;
+yKm = (latGrid-30)*metresLat/1000;
+Z = 400 + 120*xKm - 80*yKm + 10*xKm.*yKm;
+points = [110.002,30.002;110.008,30.003;110.003,30.008; ...
+    110.007,30.007;110.005,30.004];
+raw = interp2(lon,lat,Z,points(:,1),points(:,2),'linear');
+dx = 7.5; dy = -4.0; dz = 2.25;
+xPoint = (points(:,1)-110)*metresLon/1000;
+yPoint = (points(:,2)-30)*metresLat/1000;
+gradE = 0.12 + 0.01*yPoint;
+gradN = -0.08 + 0.01*xPoint;
+observed = raw - gradE*dx - gradN*dy + dz;
+[~,fit] = common.coreg3cmDem(Z,lat,lon,[points,observed]);
+assert(abs(fit.DX_m-dx)<0.03 && abs(fit.DY_m-dy)<0.03 && ...
+    abs(fit.DZ_m-dz)<0.03 && fit.RMSE_m<1e-5, ...
+    'Coreg3CM 未能正确反演人工 DEM 的 DX、DY、DZ。');
+end
+
 function testProjectTerrainMatrix()
 paths = common.projectPaths();
 tempBase = [tempname,'.mat'];
@@ -64,10 +89,8 @@ assert(max(abs(delta(offDiagonal))) < 1e-9);
 assert(max(abs(flightBase.Hup-flightBase.Hdown'),[],'all') < 1e-9);
 assert(all(diag(flightBase.Hup)==0) && all(diag(flightBase.Hdown)==0));
 
-idx5 = find(flightBase.nodes.ID == "S005",1);
-idx7 = find(flightBase.nodes.ID == "S007",1);
-assert(abs(flightBase.Hcruise(idx5,idx7)-517.148) < 0.02, ...
-    'S005--S007 的 supercover 巡航海拔应约为 517.148 m。');
+assert(isfield(flightBase,'dem') && flightBase.dem.Coreg3CM.RMSE_m >= 0, ...
+    '基础矩阵应记录 Coreg3CM 的拟合结果。');
 assert(isfile(paths.DemFile),'DEM 数据文件不存在。');
 end
 

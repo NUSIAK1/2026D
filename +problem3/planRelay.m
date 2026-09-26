@@ -1,7 +1,7 @@
 function out = planRelay(transport,data,config)
 %PLANRELAY 对点态直连缺口构造有实体机及能源组件的中继架次。
-if ~isfield(config,'GapSampleStep_s'), config.GapSampleStep_s=30; end
-if ~isfield(config,'RelayWindow_s'), config.RelayWindow_s=1800; end
+if ~isfield(config,'GapSampleStep_s'), config.GapSampleStep_s=1; end
+if ~isfield(config,'RelayPlanningStep_s'), config.RelayPlanningStep_s=10; end
 usePre=isfield(config,'RelayPrecompute') && ~isempty(config.RelayPrecompute);
 if usePre
     pre=config.RelayPrecompute;
@@ -18,6 +18,10 @@ if usePre
     backTime=pre.BackTime_s; valid=pre.Valid;
 else
     gaps=problem3.sampleGaps(transport,data,config.GapSampleStep_s);
+    gaps=problem3.compressGaps(gaps,config.GapSampleStep_s,config.RelayPlanningStep_s);
+    if isfield(config,'ExtraGapPoints') && ~isempty(config.ExtraGapPoints)
+        gaps=sortrows(unique([gaps;config.ExtraGapPoints]),'Time_s');
+    end
 end
 empty=table(strings(0,1),strings(0,1),strings(0,1),zeros(0,1), ...
     zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1),zeros(0,1), ...
@@ -36,26 +40,27 @@ nG=height(gaps);
 if ~usePre
     candidates=makeCandidates(data);
     nC=size(candidates,1);
+    if isfield(config,'Verbose') && config.Verbose
+        fprintf('[Q3] 通信预计算：%d 个缺口代表点，%d 个中继候选点。\n',nG,nC);
+    end
     gateway=gatewayPoint(data);
     cap=false(nG,nC); transit=nan(nC,1); maxService=nan(nC,1);
     backTime=nan(nC,1); valid=false(nC,1);
     for i=1:nC
+        problem3.checkDeadline(config);
         q=candidates(i,:);
         bh=problem3.linkState(q,gateway,"backhaul",data);
         if ~bh.Available, continue; end
         try
-            c=problem3.relayCost(q,0,1200,data);
+            % 用足够长的临时窗口取得飞行时间和最大服务能力；此窗口不作为任务。
+            c=problem3.relayCost(q,0,1e6,data);
         catch
             continue;
         end
         if c.MaxService_s<=0, continue; end
         transit(i)=c.LinkReady_s; maxService(i)=c.MaxService_s;
         backTime(i)=c.BackTime_s; valid(i)=true;
-        for j=1:nG
-            p=[gaps.Lon(j),gaps.Lat(j),gaps.Alt_m(j)];
-            a=problem3.linkState(p,q,"access",data);
-            cap(j,i)=a.Available;
-        end
+        cap(:,i)=problem3.linkAvailableBatch([gaps.Lon,gaps.Lat,gaps.Alt_m],q,"access",data);
     end
     offsets=zeros(nG,1);
     for k=1:nG
@@ -84,7 +89,8 @@ for k=1:numel(missions)
     m=missions(k); id=string(sprintf('R%03d',k));
     c=problem3.relayCost(candidates(m.Candidate,:),m.Start_s,m.End_s,data);
     if ~c.Feasible
-        out=struct('Feasible',false,'Failure',c.Failure,'Gaps',gaps); return;
+        out=struct('Feasible',false,'Failure',c.Failure,'Gaps',gaps, ...
+            'Uncovered',gaps,'Precompute',pre); return;
     end
     did=data.Relay.DroneIDs(m.Drone);
     cid=data.Relay.ComponentIDs(m.Component);
@@ -106,6 +112,7 @@ end
 function [missions,covered]=beamSchedule(cap,gaps,valid,transit,maxService,backTime,data,config)
 nG=height(gaps);
 if ~isfield(config,'RelayBeamWidth'), config.RelayBeamWidth=36; end
+if ~isfield(config,'RelaySelectionProfile'), config.RelaySelectionProfile=1; end
 if ~isfield(config,'RelayWindowChoices_s')
     config.RelayWindowChoices_s=[300,600,900,1500,2400,4000,7000];
 end
@@ -113,13 +120,15 @@ prototype=struct('Candidate',{},'Drone',{},'Component',{}, ...
     'Start_s',{},'End_s',{});
 initial=struct('Covered',false(nG,1),'DAvail',zeros(numel(data.Relay.DroneIDs),1), ...
     'CAvail',zeros(numel(data.Relay.ComponentIDs),1), ...
-    'Missions',prototype,'Score',0);
+    'Missions',prototype,'Score',0,'Energy_kWh',0,'LastReturn_s',0);
 beam={initial}; best=initial;
 hoverPower=data.Relay.HoverPower_kW+data.Relay.CommPower_kW;
 energyBudget=data.Relay.Use_kWh*(1-data.Relay.ReserveRatio);
 for depth=1:16
+    problem3.checkDeadline(config);
     next=cell(0,1); solved=cell(0,1);
     for b=1:numel(beam)
+        problem3.checkDeadline(config);
         state=beam{b};
         first=find(~state.Covered,1);
         if isempty(first), solved{end+1}=state; continue; end %#ok<AGROW>
@@ -148,17 +157,27 @@ for depth=1:16
                     e=energyBudget-hoverPower*(maxService(i)-duration)/3600;
                     soc=1-e/data.Relay.Use_kWh;
                     child.DAvail(di)=ret+data.Relay.TurnTime_s;
+                    child.Energy_kWh=state.Energy_kWh+e;
+                    child.LastReturn_s=max(state.LastReturn_s,ret);
                     child.CAvail(ci)=ret+common.chargeTime(soc,data.Relay.FullChargeTime_s);
                     m=struct('Candidate',i,'Drone',di,'Component',ci, ...
                         'Start_s',start,'End_s',finish);
                     child.Missions(end+1)=m;
                     nextIdx=find(~child.Covered,1);
                     if isempty(nextIdx)
-                        solved{end+1,1}=child; %#ok<AGROW>
+                        if isempty(solved) || relayScore(child,config)<relayScore(solved{1},config)
+                            solved={child};
+                        end
                     else
                         child.Score=nextIdx*1e4+nnz(child.Covered)- ...
                             0.0001*sum(child.DAvail);
                         next{end+1,1}=child; %#ok<AGROW>
+                        % 1 秒采样时覆盖向量较长；在线保留同样的 top-k，避免子状态爆内存。
+                        if numel(next)>2*config.RelayBeamWidth
+                            scores=cellfun(@(x)x.Score,next);
+                            [~,ord]=sort(scores,'descend');
+                            next=next(ord(1:config.RelayBeamWidth));
+                        end
                         if child.Score>best.Score, best=child; end
                     end
                 end
@@ -166,7 +185,8 @@ for depth=1:16
         end
     end
     if ~isempty(solved)
-        [~,idx]=min(cellfun(@(x)sum(x.DAvail),solved));
+        scores=cellfun(@(x)relayScore(x,config),solved);
+        [~,idx]=min(scores);
         missions=solved{idx}.Missions; covered=true(nG,1); return;
     end
     if isempty(next), break; end
@@ -175,6 +195,16 @@ for depth=1:16
     beam=next(ord(1:min(config.RelayBeamWidth,numel(ord))));
 end
 missions=best.Missions; covered=best.Covered;
+end
+
+function score=relayScore(state,config)
+if config.RelaySelectionProfile==2
+    score=state.Energy_kWh+1e-6*state.LastReturn_s;
+elseif config.RelaySelectionProfile==3
+    score=state.Energy_kWh/10+state.LastReturn_s/8000;
+else
+    score=state.LastReturn_s+1e-3*state.Energy_kWh;
+end
 end
 
 function candidates=makeCandidates(data)
@@ -210,13 +240,14 @@ ok=isfinite(data.Dem.Z(indices));
 rc=rc(ok); cc=cc(ok);
 coords=unique([cc,rc],'rows','stable');
 ground=data.Dem.Z(sub2ind(size(data.Dem.Z),coords(:,2),coords(:,1)));
+lon=data.Dem.Lon(coords(:,1)); lon=lon(:);
+lat=data.Dem.Lat(coords(:,2)); lat=lat(:);
 levels=unique(min(data.Relay.MaxAGL_m,[100,200,300]));
 levels=levels(levels>0);
 candidates=zeros(size(coords,1)*numel(levels),3);
 for k=1:numel(levels)
     rows=(k-1)*size(coords,1)+(1:size(coords,1));
-    candidates(rows,:)=[data.Dem.Lon(coords(:,1)), ...
-        data.Dem.Lat(coords(:,2)),ground+levels(k)];
+    candidates(rows,:)=[lon,lat,ground+levels(k)];
 end
 end
 

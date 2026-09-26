@@ -23,14 +23,20 @@ if ~isfolder(parent), mkdir(parent); end
 config.ResultDir = fullfile(parent,[char(datetime('now','Format','yyyyMMdd_HHmmss')),'_',suffix]);
 assert(~isfolder(config.ResultDir),'实验目录已存在，拒绝覆盖。');
 mkdir(config.ResultDir);
+recordDir = getenv('Q2_RUN_RECORD');
+if ~isempty(recordDir)
+    fid = fopen(fullfile(recordDir,'result_path.txt'),'w','n','UTF-8');
+    assert(fid >= 0,'无法记录本轮结果目录。');
+    fprintf(fid,'%s',config.ResultDir);
+    fclose(fid);
+end
 config.CheckpointDir = fullfile(config.ResultDir,'检查点');
 diary(fullfile(config.ResultDir,'运行日志.txt'));
 cleanDiary = onCleanup(@()diary('off')); %#ok<NASGU>
 fprintf('独立优化输出：%s\n初始档案（只读）：%s\n',config.ResultDir,config.SeedArchiveFile);
-source = load(config.SeedArchiveFile,'paretoArchive');
-old = vertcat(source.paretoArchive.ParetoOutcomes{:});
-oldObjectives = vertcat(old.Objectives);
 result = problem2.run_problem2(config);
+% 跨地形运行只与当前口径下的可行旧方案比较，禁止混合历史目标。
+oldObjectives = table2array(result.SeedDiagnostics);
 new = vertcat(result.ParetoOutcomes{:});
 newObjectives = vertcat(new.Objectives);
 covered = false(size(oldObjectives,1),1);
@@ -65,7 +71,8 @@ for k = 1:numel(names)
             {'BoxID','TripID','ServiceID','Delivery_s'})));
     end
 end
-result.BaselineComparison = table((1:numel(covered)).',covered,improved, ...
+seedIndices = result.SeedReevaluation.OriginalIndex(result.SeedReevaluation.Feasible);
+result.BaselineComparison = table(seedIndices,covered,improved, ...
     'VariableNames',{'OldSolutionIndex','Covered','StrictlyDominated'});
 result.ExtremeComparison = table(["及时性";"完成时间_s";"能耗_kWh";"架次数"], ...
     min(oldObjectives,[],1).',min(newObjectives,[],1).', ...
@@ -77,6 +84,9 @@ save(fullfile(config.ResultDir,'优化实验完整记录.mat'),'result','-v7.3')
 writetable(result.ExtremeComparison,fullfile(config.ResultDir,'新旧方案对比.xlsx'),'Sheet','目标极值');
 writetable(result.BaselineComparison,fullfile(config.ResultDir,'新旧方案对比.xlsx'),'Sheet','旧解覆盖');
 summary = struct('Passed',true,'SeedCount',size(oldObjectives,1), ...
+    'OriginalSeedCount',height(result.SeedReevaluation), ...
+    'InfeasibleSeedCount',nnz(~result.SeedReevaluation.Feasible), ...
+    'SeedEvaluationMode',result.Config.SeedEvaluationMode, ...
     'ArchiveCount',size(newObjectives,1),'Covered',nnz(covered), ...
     'StrictlyDominated',nnz(improved),'RepresentativeCount',numel(names), ...
     'SubmissionReadbackPassed',logical(config.ExportFiles), ...

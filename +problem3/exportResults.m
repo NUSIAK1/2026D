@@ -54,7 +54,7 @@ if ~isempty(balanced.Relay.RelayTrips)
     writetable(balanced.Relay.ComponentTimeline,analysis,'Sheet','中继组件周转');
 end
 writetable(balanced.Validation.Checks,analysis,'Sheet','校核');
-writetable(result.RunLog,analysis,'Sheet','运行记录');
+if ~isempty(result.RunLog), writetable(result.RunLog,analysis,'Sheet','运行记录'); end
 if ~isempty(result.OperatorLog)
     writetable(result.OperatorLog,analysis,'Sheet','算子诊断');
 end

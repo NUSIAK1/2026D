@@ -9,7 +9,8 @@ base=problem3.decodeTransport(seed,data);
 if ~base.Feasible
     result=struct('Feasible',false,'Failure',base.Failure,'Iterations',0); return;
 end
-first=problem3.planRelay(base,data,config);
+clock=tic;
+first=problem3.planCertifiedRelay(base,data,config);
 if first.Feasible
     initialCert=problem3.certifyCoverage(base,first.RelayTrips,data,config);
     if initialCert.Feasible
@@ -24,16 +25,17 @@ config.RelayPrecompute=pre;
 current=seed; currentRelay=first;
 best=seed; bestTransport=base; bestRelay=first;
 bestScore=score(first);
-clock=tic; accepted=0; feasiblePoint=0;
+accepted=0; feasiblePoint=0; it=0;
 for it=1:config.TimingIterations
     if toc(clock)>=config.TimeLimit_s, break; end
     if mod(it,150)==1 && it>1
         current=best; currentRelay=bestRelay;
     end
     trial=mutate(current,currentRelay);
+    if isequaln(trial,current), continue; end
     transport=problem3.decodeTransport(trial,data);
     if ~transport.Feasible, continue; end
-    relay=problem3.planRelay(transport,data,config);
+    relay=problem3.planCertifiedRelay(transport,data,config);
     s=score(relay);
     if s>bestScore+1e-9
         best=trial; bestTransport=transport; bestRelay=relay; bestScore=s;

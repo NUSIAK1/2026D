@@ -123,6 +123,15 @@ resultQ2 = problem2.run_problem2(q2Config);
 
 ## DEM 航段高程口径
 
+在计算基础矩阵前，`common.computeTerrainMatrices` 会把 `调度中心与服务区.xlsx`
+中的 O01、S001--S015 经纬度和海拔作为实测控制点，对原始 DEM 执行
+Coreg3CM 三维共配准。程序从原 DEM 提取控制点处的坡度、坡向，按
+`Δh = -∂z/∂E·DX - ∂z/∂N·DY + DZ` 最小二乘反演整体东向、北向和垂直偏移；
+再以水平平移重采样和垂直偏移生成校正 DEM。控制点不会被用于插值或重建地形。
+`flightBase.mat` 与基础参数表的 Metadata 会记录 DX、DY、DZ 及校核残差；
+问题三也通过同一公共函数读取校正 DEM。因此首次使用此版本或节点高程改变后，
+应先重新运行 `common.computeTerrainMatrices()`，再运行问题一至问题四。
+
 航段经过的 DEM 像元采用二维 Amanatides--Woo 闭合 supercover 遍历：
 像元中心坐标为整数、边界为半整数，边界飞行、角点穿越和端点接触的全部
 有效像元均纳入最高地形计算。DEM 中的 NoData、NaN、Inf 或越界像元会使

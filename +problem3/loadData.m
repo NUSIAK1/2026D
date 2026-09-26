@@ -7,6 +7,7 @@ if ~isfield(config,'TransportUavFile'), config.TransportUavFile = paths.Transpor
 if ~isfield(config,'RelayUavFile'), config.RelayUavFile = fullfile(paths.BaseDataDir,'中继无人机数据.xlsx'); end
 if ~isfield(config,'CommFile'), config.CommFile = fullfile(paths.BaseDataDir,'通信链路参数.xlsx'); end
 if ~isfield(config,'DemFile'), config.DemFile = paths.DemFile; end
+if ~isfield(config,'ControlPointFile'), config.ControlPointFile = paths.NodeFile; end
 if ~isfile(config.FlightBaseFile)
     error('缺少 flightBase.mat；请先运行 common.computeTerrainMatrices。');
 end
@@ -98,16 +99,16 @@ for i=1:4
     comm.Gain_dBi(i) = getParam(raw,symCol,valCol,names(i),"G");
 end
 
-demRaw = load(config.DemFile);
-assert(double(demRaw.epsg_code(1))==4326,'DEM 必须为 EPSG:4326。');
-Z = double(demRaw.dem);
-Z(Z==double(demRaw.nodata(1)))=NaN;
-lat=double(demRaw.latitude(:)); lon=double(demRaw.longitude(:));
-if lat(1)>lat(end), lat=flipud(lat); Z=flipud(Z); end
-if lon(1)>lon(end), lon=flipud(lon); Z=fliplr(Z); end
-assert(numel(lat)==size(Z,1) && numel(lon)==size(Z,2),'DEM 坐标与矩阵尺寸不符。');
-dem = struct('Z',Z,'Lat',lat,'Lon',lon,'dLat',mean(diff(lat)), ...
-    'dLon',mean(diff(lon)));
+% 优先复用基础矩阵生成时保存的校正 DEM，避免运输与通信采用不同栅格。
+if isfield(base,'dem') && isfield(base.dem,'SourceFile') && ...
+        isfield(base.dem,'ControlPointFile') && ...
+        string(base.dem.SourceFile)==string(config.DemFile) && ...
+        string(base.dem.ControlPointFile)==string(config.ControlPointFile)
+    dem = base.dem;
+else
+    dem = common.loadCoreg3CMDem(config.DemFile,config.ControlPointFile);
+end
+assert(dem.epsgCode==4326,'DEM 必须为 EPSG:4326。');
 
 data = struct('FlightBase',base,'Nodes',base.nodes,'Boxes',boxes, ...
     'Models',models,'Drones',drones,'Batteries',batteries, ...

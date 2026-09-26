@@ -1,9 +1,11 @@
 function seeds = loadSeeds(config,data)
 %LOADSEEDS 从问题二正式提交簿构造可重排程的运输初始解。
 labels=["及时性优先","完成时间优先","能耗优先","架次数优先","折中方案"];
+% 输入与输出独立；独立优化入口必须显式指定问题二来源。
+if ~isfield(config,'SeedResultDir'), config.SeedResultDir=config.ResultDir; end
 seeds={};
 for i=1:numel(labels)
-    file=fullfile(config.ResultDir,"问题二_结果提交_"+labels(i)+".xlsx");
+    file=fullfile(config.SeedResultDir,"问题二_结果提交_"+labels(i)+".xlsx");
     if ~isfile(file), continue; end
     try
         tr=readcell(file,'Sheet','Q2_运输架次');

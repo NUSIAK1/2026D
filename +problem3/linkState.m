@@ -21,7 +21,7 @@ if unobstructedLoss>threshold+1e-9
         'Distance_km',d0);
     return;
 end
-[pixels,tLo,tHi] = rayPixels(a,b,data.Dem);
+[pixels,tLo,tHi] = problem3.communicationRay(a,b,data.Dem);
 z=data.Dem.Z(sub2ind(size(data.Dem.Z),pixels(:,1),pixels(:,2)));
 if any(~isfinite(z))
     state=struct('Available',false,'UnknownTerrain',true,'Obstructed',false, ...
@@ -37,33 +37,6 @@ state=struct('Available',loss<=threshold+1e-9, ...
     'UnknownTerrain',false,'Obstructed',blocked, ...
     'Margin_dB',threshold-loss,'Threshold_dB',threshold, ...
     'Distance_km',d);
-end
-
-function [pixels,tLo,tHi] = rayPixels(a,b,dem)
-ca=1+(a(1)-dem.Lon(1))/dem.dLon;
-cb=1+(b(1)-dem.Lon(1))/dem.dLon;
-ra=1+(a(2)-dem.Lat(1))/dem.dLat;
-rb=1+(b(2)-dem.Lat(1))/dem.dLat;
-sz=size(dem.Z);
-if any(~isfinite([ca,cb,ra,rb])) || ...
-        min([ca,cb])<0.5-1e-8 || max([ca,cb])>sz(2)+0.5+1e-8 || ...
-        min([ra,rb])<0.5-1e-8 || max([ra,rb])>sz(1)+0.5+1e-8
-    error('通信射线超出 DEM 覆盖范围。');
-end
-pixels=common.traceDemSupercover([ca,ra],[cb,rb],sz);
-dx=cb-ca; dy=rb-ra;
-tLo=zeros(size(pixels,1),1); tHi=ones(size(pixels,1),1);
-if abs(dx)>1e-12
-    x1=(pixels(:,2)-0.5-ca)/dx;
-    x2=(pixels(:,2)+0.5-ca)/dx;
-    tLo=max(tLo,min(x1,x2)); tHi=min(tHi,max(x1,x2));
-end
-if abs(dy)>1e-12
-    y1=(pixels(:,1)-0.5-ra)/dy;
-    y2=(pixels(:,1)+0.5-ra)/dy;
-    tLo=max(tLo,min(y1,y2)); tHi=min(tHi,max(y1,y2));
-end
-tLo=max(0,min(1,tLo)); tHi=max(0,min(1,tHi));
 end
 
 function d=pointDistance(a,b)

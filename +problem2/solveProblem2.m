@@ -22,28 +22,50 @@ warmStart = loadExternalWarmStart(data,base,config);
 archiveSolutions = {};
 archiveOutcomes = {};
 seedDiagnostics = table();
+seedReevaluation = table();
 if strlength(string(config.SeedArchiveFile)) > 0
     seed = load(config.SeedArchiveFile,'paretoArchive');
     assert(isfield(seed,'paretoArchive'),'初始档案缺少 paretoArchive。');
     old = seed.paretoArchive;
     seedObjectives = zeros(numel(old.ParetoSolutions),4);
+    originalObjectives = zeros(size(seedObjectives));
+    seedFeasible = false(size(seedObjectives,1),1);
+    seedViolation = zeros(size(seedFeasible));
     for k = 1:numel(old.ParetoSolutions)
         sol = old.ParetoSolutions{k};
         assert(isequal(sort(sol.Order),1:numel(sol.Trips)), '旧档案派发顺序无效。');
         assert(isequal(sort([sol.Trips.BoxIdx]),1:height(data.Boxes)), '旧档案货箱覆盖无效。');
         out = decodeSolution(sol,data,base);
+        if config.SeedEvaluationMode == "strict"
         assert(out.Feasible,'旧档案第 %d 个方案在当前口径下不可行。',k);
         assert(max(abs(out.Objectives-old.ParetoOutcomes{k}.Objectives)) < 1e-7, ...
-            '旧档案第 %d 个方案的重算目标不一致，停止优化。',k);
+            ['旧档案第 %d 个方案的重算目标不一致，停止优化。\n' ...
+            '旧目标 [及时性,秒,kWh,架次]=%s\n当前目标=%s\n地形缓存=%s'], ...
+            k,mat2str(old.ParetoOutcomes{k}.Objectives,12), ...
+            mat2str(out.Objectives,12),char(config.FlightBaseFile));
         assert(isequaln(out.Deliveries,old.ParetoOutcomes{k}.Deliveries) && ...
             isequaln(out.Trips,old.ParetoOutcomes{k}.Trips), '旧方案逐箱或逐架次重算不一致。');
+        end
         seedObjectives(k,:) = out.Objectives;
+        originalObjectives(k,:) = old.ParetoOutcomes{k}.Objectives;
+        seedFeasible(k) = out.Feasible;
+        seedViolation(k) = out.Violation;
         [archiveSolutions,archiveOutcomes] = problem2.updateParetoArchive( ...
             archiveSolutions,archiveOutcomes,sol,out,inf);
     end
-    seedDiagnostics = array2table(seedObjectives,'VariableNames', ...
+    seedReevaluation = table((1:numel(seedFeasible)).',seedFeasible,seedViolation, ...
+        originalObjectives,seedObjectives,seedObjectives-originalObjectives, ...
+        'VariableNames',{'OriginalIndex','Feasible','Violation','OriginalObjectives', ...
+        'RecomputedObjectives','ObjectiveDelta'});
+    assert(any(seedFeasible),'旧档案在当前地形下没有可行方案，不能继续增量优化；需重新构造初始方案。');
+    seedDiagnostics = array2table(seedObjectives(seedFeasible,:),'VariableNames', ...
         {'Timeliness','Makespan_s','Energy_kWh','TripCount'});
-    config.BaselineMakespan_s = min(seedObjectives(:,2));
+    config.BaselineMakespan_s = min(seedObjectives(seedFeasible,2));
+    fprintf('[Q2] 旧档案重算完成：%d/%d 可行；基线采用当前地形重算目标。模式：%s\n', ...
+        nnz(seedFeasible),numel(seedFeasible),config.SeedEvaluationMode);
+    if config.ExportFiles
+        writetable(seedReevaluation,fullfile(config.ResultDir,'旧档案地形重算审计.xlsx'));
+    end
 end
 runLog = table();
 % 数值缓冲区按块增长，避免每次迭代拼接整张历史表。
@@ -56,6 +78,10 @@ operatorCounts = zeros(numel(operatorNames),8);
 operatorElapsed = zeros(numel(operatorNames),1);
 operatorNoop = zeros(numel(operatorNames),1);
 operatorImproved = zeros(numel(operatorNames),1);
+neighborhoodEvaluated = zeros(numel(operatorNames),1);
+neighborhoodFeasible = zeros(numel(operatorNames),1);
+neighborhoodAdded = zeros(numel(operatorNames),1);
+localSolutions = {}; localOutcomes = {}; localAdded = 0;
 completedIterations = 0;
 plannedIterations = config.NumRuns*config.MaxIterations;
 
@@ -70,15 +96,11 @@ for runIdx = 1:config.NumRuns
     rng(config.RandomSeed+runIdx-1,'twister');
     profile = config.RunProfiles(mod(runIdx-1,numel(config.RunProfiles))+1);
     if ~isempty(archiveSolutions)
-        scores = cellfun(@(o)scoreOutcome(o,profile),archiveOutcomes);
-        [~,seedIdx] = min(scores);
+        ranked = rankOutcomes(archiveOutcomes,profile);
+        seedIdx = ranked(1);
         current = archiveSolutions{seedIdx};
     else
         current = buildInitialSolution(data, base, config, profile, runIdx, warmStart);
-    end
-    if runIdx > 1
-        current = diversifyRestart(current,archiveSolutions,archiveOutcomes, ...
-            data,base,profile,runIdx);
     end
     seedTripCount = numel(current.Trips);
     current = repairHardDeadlines(current, data, base, config);
@@ -106,12 +128,22 @@ for runIdx = 1:config.NumRuns
         end
         operator = roulette(destroyScore);
         operatorClock = tic;
-        candidate = perturbSolution(current, data, base, operator, profile);
+        localSolutions = {}; localOutcomes = {}; localAdded = 0;
+        candidate = perturbSolution(current, data, base, operator, profile,@recordNeighborhood);
+        % 小比例探索内部已解码的其他可行结构，交由外层退火决定是否移动。
+        if ~isempty(localSolutions) && rand < 0.20
+            candidate = localSolutions{randi(numel(localSolutions))};
+        end
         if isequaln(candidate,current)
             candidateOutcome = currentOutcome;
         else
-            candidate = repairHardDeadlines(candidate, data, base, config);
-            candidateOutcome = decodeSolution(candidate, data, base);
+            cached = find(cellfun(@(s)isequaln(s,candidate),localSolutions),1);
+            if ~isempty(cached)
+                candidateOutcome = localOutcomes{cached};
+            else
+                candidate = repairHardDeadlines(candidate, data, base, config);
+                candidateOutcome = decodeSolution(candidate, data, base);
+            end
         end
         unchanged = isequaln(candidate,current);
         elapsedOperator_s = toc(operatorClock);
@@ -128,7 +160,7 @@ for runIdx = 1:config.NumRuns
             case "added", operatorCounts(operator,5) = operatorCounts(operator,5)+1;
             case "pruned", operatorCounts(operator,6) = operatorCounts(operator,6)+1;
         end
-        if archiveStatus == "added"
+        if archiveStatus == "added" || localAdded > 0
             stagnant = 0;
         else
             stagnant = stagnant+1;
@@ -139,19 +171,17 @@ for runIdx = 1:config.NumRuns
             min(1,toc(runClock)/max(runBudget_s,eps)));
         temperature = config.InitialTemperature* ...
             (config.FinalTemperature/config.InitialTemperature)^progress;
-        previousScore = scoreOutcome(currentOutcome,profile);
-        candidateScore = scoreOutcome(candidateOutcome,profile);
-        improved = ~unchanged && candidateOutcome.Feasible && candidateScore < previousScore-1e-12;
+        delta = compareOutcomes(candidateOutcome,currentOutcome,profile);
+        improved = ~unchanged && candidateOutcome.Feasible && delta < -1e-12;
         operatorImproved(operator) = operatorImproved(operator)+improved;
-        reward = 6*(archiveStatus == "added")+3*improved;
+        reward = 6*((archiveStatus == "added")+localAdded)+3*improved;
         if ~unchanged && acceptCandidate(currentOutcome,candidateOutcome,temperature,profile, ...
                 config.WorseAcceptanceCap)
             current = candidate;
             currentOutcome = candidateOutcome;
             accepted = accepted+1;
-            reward = reward+0.25;
             operatorCounts(operator,7) = operatorCounts(operator,7)+1;
-            if candidateScore > previousScore+1e-12
+            if delta > 1e-12
                 operatorCounts(operator,8) = operatorCounts(operator,8)+1;
             end
         end
@@ -199,7 +229,7 @@ for runIdx = 1:config.NumRuns
             break;
         elseif stagnant > 0 && mod(stagnant,config.RestartEvery) == 0
             current = diversifyRestart(current,archiveSolutions,archiveOutcomes, ...
-                data,base,profile,runIdx+stagnant);
+                profile);
             current = repairHardDeadlines(current,data,base,config);
             currentOutcome = decodeSolution(current,data,base);
         end
@@ -268,6 +298,7 @@ result.ConvergenceLog = addvars(result.ConvergenceLog, ...
     convergenceProfiles(1:completedIterations),'After','Run','NewVariableNames','Profile');
 result.OperatorLog = operatorLog;
 result.SeedDiagnostics = seedDiagnostics;
+result.SeedReevaluation = seedReevaluation;
 result.SearchElapsed_s = toc(overallClock);
 result.OperatorDiagnostics = table(operatorNames.',operatorCounts(:,1), ...
     operatorCounts(:,2),operatorCounts(:,3),operatorCounts(:,4), ...
@@ -279,7 +310,11 @@ result.OperatorDiagnostics = table(operatorNames.',operatorCounts(:,1), ...
 result.OperatorDiagnostics.Elapsed_s = operatorElapsed;
 result.OperatorDiagnostics.Unchanged = operatorNoop;
 result.OperatorDiagnostics.ScoreImproved = operatorImproved;
-result.OperatorDiagnostics.AddedPerSecond = operatorCounts(:,5)./max(operatorElapsed,eps);
+result.OperatorDiagnostics.InternalEvaluated = neighborhoodEvaluated;
+result.OperatorDiagnostics.InternalFeasible = neighborhoodFeasible;
+result.OperatorDiagnostics.InternalAdded = neighborhoodAdded;
+result.OperatorDiagnostics.AddedPerSecond = ...
+    (operatorCounts(:,5)+neighborhoodAdded)./max(operatorElapsed,eps);
 result.OutputFiles = struct();
 if config.ExportFiles
     result.OutputFiles = exportResults(result,data,config);
@@ -289,12 +324,27 @@ if config.Verbose
     fprintf('问题二：得到 %d 个可行非支配方案，选择方案 %d。\n', ...
         numel(archiveOutcomes), balancedIndex);
 end
+
+    function recordNeighborhood(sol,out)
+        % 所有内部完整解码候选都经过正式支配筛选；已解码结果直接复用。
+        neighborhoodEvaluated(operator) = neighborhoodEvaluated(operator)+1;
+        if ~out.Feasible, return; end
+        neighborhoodFeasible(operator) = neighborhoodFeasible(operator)+1;
+        localSolutions{end+1} = sol;
+        localOutcomes{end+1} = out;
+        [archiveSolutions,archiveOutcomes,status] = problem2.updateParetoArchive( ...
+            archiveSolutions,archiveOutcomes,sol,out,config.ArchiveSize);
+        if status == "added"
+            localAdded = localAdded+1;
+            neighborhoodAdded(operator) = neighborhoodAdded(operator)+1;
+        end
+    end
 end
 
 function config = applyDefaults(config)
 paths = common.projectPaths();
 defaults = struct( ...
-    'AlgorithmVersion',"q2-efficient-neighborhoods-v3", ...
+    'AlgorithmVersion',"q2-visible-lexicographic-v4", ...
     'FlightBaseFile',paths.FlightBaseFile, ...
     'DemandFile',paths.DemandFile, ...
     'TransportUavFile',paths.TransportUavFile, ...
@@ -314,6 +364,7 @@ defaults = struct( ...
     'WarmStartTripFile',"", ...
     'WarmStartDeliveryFile',"", ...
     'SeedArchiveFile',"", ...
+    'SeedEvaluationMode',"strict", ...
     'AdaptationEvery',40, ...
     'RunProfiles',["timeliness","makespan","energy","trips","balanced"], ...
     'BaselineMakespan_s',9643.64851977594, ...
@@ -329,6 +380,9 @@ for k = 1:numel(names)
         config.(names{k}) = defaults.(names{k});
     end
 end
+config.SeedEvaluationMode = string(config.SeedEvaluationMode);
+assert(isscalar(config.SeedEvaluationMode) && ...
+    any(config.SeedEvaluationMode == ["strict","recompute"]),'无效的旧档案评价模式。');
 end
 
 function data = loadProblemData(config, flightBase)
@@ -652,7 +706,7 @@ end
 solution.Order = urgencyOrder(solution,data);
 end
 
-function solution = perturbSolution(solution,data,base,operator,profile)
+function solution = perturbSolution(solution,data,base,operator,profile,visit)
 if isempty(solution.Trips), return; end
 nTrip = numel(solution.Trips);
 switch operator
@@ -681,24 +735,24 @@ switch operator
         idx = ranked(randi(min(3,nTrip)));
         remove = solution.Trips(idx).BoxIdx;
     case 4 % 整架次机型调整：不捆绑随机派发扰动。
-        solution = improveModelAssignment(solution,data,base,profile);
+        solution = improveModelAssignment(solution,data,base,profile,visit);
         return;
     case 5 % 仅改变单架次访问顺序。
         solution = tryRouteNeighborhood(solution,data,base);
         return;
     case 6 % 派发顺序：瓶颈强化与同机型随机探索。
         if rand < 0.75
-        solution = improveCriticalOrder(solution,data,base,profile);
+        solution = improveCriticalOrder(solution,data,base,profile,visit);
         else
             solution = perturbOrder(solution,data,base,profile);
         end
         return;
     case 7 % 瓶颈拆分，所有机型均按真实约束参与。
-        solution = splitCriticalTrip(solution,data,base,profile);
+        solution = splitCriticalTrip(solution,data,base,profile,visit);
         return;
     case 8 % 单箱迁移与交换是同一货箱重分配邻域的两种尺度。
         if rand < 0.8
-        solution = transferCriticalBox(solution,data,base,profile);
+        solution = transferCriticalBox(solution,data,base,profile,visit);
         else
             solution = tryCrossTripExchange(solution,data,base);
         end
@@ -795,10 +849,10 @@ for r = idx
 end
 end
 
-function solution = improveModelAssignment(solution,data,base,profile)
+function solution = improveModelAssignment(solution,data,base,profile,visit)
 % 用真实无人机/电池排程比较替代机型，避免仅凭平均工作量判断收益。
 source = solution;
-bestScore = scoreOutcome(decodeSolution(source,data,base),profile);
+bestOutcome = decodeSolution(source,data,base);
 critical = criticalTripIndices(source,data,base);
 pool = unique([critical,randperm(numel(source.Trips),min(3,numel(source.Trips)))],'stable');
 for r = pool
@@ -809,9 +863,10 @@ for r = pool
         trial = source; trial.Trips(r).Model = model;
         if ~evaluateTrip(trial.Trips(r),data,base).Feasible, continue; end
         out = decodeSolution(trial,data,base);
-        value = scoreOutcome(out,profile);
-        if out.Feasible && value < bestScore-1e-12
-            solution = trial; bestScore = value;
+        visit(trial,out);
+        value = compareOutcomes(out,bestOutcome,profile);
+        if out.Feasible && value < -1e-12
+            solution = trial; bestOutcome = out;
         end
     end
 end
@@ -890,32 +945,17 @@ end
 [~,order] = sortrows(key,[1 2 3 4]); order = order.';
 end
 
-function solution = diversifyRestart(solution,archiveSolutions,archiveOutcomes, ...
-        data,base,profile,runKey)
-% 从当前档案的相应目标极值附近重新搜索，但每次尝试不同邻域。
-if ~isempty(archiveSolutions)
-    scores = zeros(1,numel(archiveOutcomes));
-    for k = 1:numel(scores)
-        scores(k) = scoreOutcome(archiveOutcomes{k},profile);
-    end
-    [~,ranked] = sort(scores);
+function solution = diversifyRestart(solution,archiveSolutions,archiveOutcomes,profile)
+% 每段从真实极值出发；停滞时兼顾极值邻域和整个前沿的结构多样性。
+if isempty(archiveSolutions), return; end
+ranked = rankOutcomes(archiveOutcomes,profile);
+if rand < 0.8
     idx = ranked(randi(min(5,numel(ranked))));
-    solution = archiveSolutions{idx};
+else
+    idx = ranked(randi(numel(ranked)));
 end
-source = solution;
-operators = [6,7,8,4,5,1,2,3];
-for attempt = 1:numel(operators)
-    op = operators(mod(runKey+attempt-2,numel(operators))+1);
-    candidate = perturbSolution(source,data,base,op,profile);
-    if isequaln(candidate,source), continue; end
-    out = decodeSolution(candidate,data,base);
-    if out.Feasible
-        solution = candidate;
-        return;
-    end
+solution = archiveSolutions{idx};
 end
-end
-
 function idx = criticalTripIndices(solution,data,base)
 out = decodeSolution(solution,data,base);
 if isempty(out.Trips) || ~all(isfinite(out.Trips.Return_s))
@@ -929,11 +969,11 @@ sameDrone = find(out.Trips.DroneID == droneID);
 idx = sameDrone(p(1:min(3,numel(p)))).';
 end
 
-function solution = improveCriticalOrder(solution,data,base,profile)
+function solution = improveCriticalOrder(solution,data,base,profile,visit)
 critical = criticalTripIndices(solution,data,base);
 if isempty(critical), return; end
 best = solution;
-bestScore = scoreOutcome(decodeSolution(solution,data,base),profile);
+bestOutcome = decodeSolution(solution,data,base);
 for r = critical(1:min(2,numel(critical)))
     pos = find(solution.Order == r,1);
     if isempty(pos), continue; end
@@ -946,11 +986,12 @@ for r = critical(1:min(2,numel(critical)))
         order(pos) = [];
         trial.Order = [order(1:target-1),r,order(target:end)];
         out = decodeSolution(trial,data,base);
+        visit(trial,out);
         if out.Feasible
-            value = scoreOutcome(out,profile);
-            if value < bestScore
+            value = compareOutcomes(out,bestOutcome,profile);
+            if value < -1e-12
                 best = trial;
-                bestScore = value;
+                bestOutcome = out;
             end
         end
     end
@@ -958,11 +999,11 @@ end
 solution = best;
 end
 
-function solution = splitCriticalTrip(solution,data,base,profile)
+function solution = splitCriticalTrip(solution,data,base,profile,visit)
 critical = criticalTripIndices(solution,data,base);
 if isempty(critical), return; end
 best = solution;
-bestScore = scoreOutcome(decodeSolution(solution,data,base),profile);
+bestOutcome = decodeSolution(solution,data,base);
 fullDecodes = 0;
 for r = critical(randperm(numel(critical)))
     trip = solution.Trips(r);
@@ -994,12 +1035,13 @@ for r = critical(randperm(numel(critical)))
                 candidate.Order = [trial.Order(1:insertAt-1), ...
                     numel(trial.Trips),trial.Order(insertAt:end)];
                 out = decodeSolution(candidate,data,base);
+                visit(candidate,out);
                 fullDecodes = fullDecodes+1;
                 if out.Feasible
-                    value = scoreOutcome(out,profile);
-                    if value < bestScore
+                    value = compareOutcomes(out,bestOutcome,profile);
+                    if value < -1e-12
                         best = candidate;
-                        bestScore = value;
+                        bestOutcome = out;
                     end
                 end
                 if fullDecodes >= 16, break; end
@@ -1013,11 +1055,11 @@ end
 solution = best;
 end
 
-function solution = transferCriticalBox(solution,data,base,profile)
+function solution = transferCriticalBox(solution,data,base,profile,visit)
 critical = criticalTripIndices(solution,data,base);
 if isempty(critical), return; end
 best = solution;
-bestScore = scoreOutcome(decodeSolution(solution,data,base),profile);
+bestOutcome = decodeSolution(solution,data,base);
 fullDecodes = 0;
 for r = critical
     source = solution.Trips(r);
@@ -1042,12 +1084,13 @@ for r = critical
             trial.Trips(r) = donor;
             trial.Trips(target) = recipient;
             out = decodeSolution(trial,data,base);
+        visit(trial,out);
             fullDecodes = fullDecodes+1;
             if out.Feasible
-                value = scoreOutcome(out,profile);
-                if value < bestScore
+                value = compareOutcomes(out,bestOutcome,profile);
+                if value < -1e-12
                     best = trial;
-                    bestScore = value;
+                    bestOutcome = out;
                 end
             end
             if fullDecodes >= 12, break; end
@@ -1459,31 +1502,42 @@ end
 function tf = acceptCandidate(current,candidate,temperature,profile,worseCap)
 if candidate.Feasible && ~current.Feasible, tf = true; return; end
 if ~candidate.Feasible && current.Feasible, tf = false; return; end
-delta = scoreOutcome(candidate,profile)-scoreOutcome(current,profile);
+delta = compareOutcomes(candidate,current,profile);
 tf = delta <= 0 || rand < min(worseCap,exp(-delta/max(temperature,1e-9)));
 end
 
-function value = scoreOutcome(outcome,profile)
-o = outcome.Objectives;
-% 四目标采用固定、可解释的参考尺度，避免原始秒/kWh/架次量纲让
-% 模拟退火退化为只接受改进的贪心过程。正式 Pareto 支配判断仍使用
-% 未缩放的原始目标值。
-if ~outcome.Feasible
-    value = 1e6 + outcome.Violation;
+function delta = compareOutcomes(candidate,current,profile)
+% 以首个显著不同的目标决定方向；主目标改善不再被次目标抵消。
+if ~candidate.Feasible || ~current.Feasible
+    delta = (1e6*~candidate.Feasible+candidate.Violation) - ...
+        (1e6*~current.Feasible+current.Violation);
     return;
 end
-scale = [1,2e4,50,20];
-z = o./scale;
-switch profile
-    case "timeliness", weight = [0.70,0.12,0.10,0.08];
-    case "makespan", weight = [0.10,0.70,0.10,0.10];
-    case "energy", weight = [0.10,0.10,0.70,0.10];
-    case "trips", weight = [0.10,0.10,0.10,0.70];
-    otherwise, weight = [0.25,0.25,0.25,0.25];
-end
-value = sum(weight.*z);
+a = searchKey(candidate.Objectives,profile);
+b = searchKey(current.Objectives,profile);
+idx = find(abs(a-b) > 1e-12,1);
+if isempty(idx), delta = 0; else, delta = a(idx)-b(idx); end
 end
 
+function ranked = rankOutcomes(outcomes,profile)
+obj = cellfun(@(o)o.Objectives,outcomes,'UniformOutput',false);
+key = searchKey(vertcat(obj{:}),profile);
+[~,ranked] = sortrows(key);
+end
+
+function key = searchKey(obj,profile)
+z = obj./[1,2e4,50,20];
+switch profile
+    case "timeliness", order = [1,2,3,4];
+    case "makespan", order = [2,1,3,4];
+    case "energy", order = [3,1,2,4];
+    case "trips", order = [4,1,2,3];
+    otherwise
+        key = [max(z,[],2),sum(z,2),z];
+        return;
+end
+key = z(:,order);
+end
 function op = roulette(weights)
 c = cumsum(weights/sum(weights)); op = find(rand <= c,1); if isempty(op), op=numel(weights); end
 end

@@ -1,5 +1,6 @@
-function test_problem3()
+function test_problem3(config)
 %TEST_PROBLEM3 题面参数、边界和全量方案回归测试。
+if nargin<1, config=struct(); end
 p=common.projectPaths();
 d=problem3.loadData(struct('FlightBaseFile',p.FlightBaseFile));
 assert(height(d.Nodes)==16 && height(d.Boxes)==80);
@@ -32,6 +33,15 @@ assert(~q.Available && q.Obstructed);
 tiny.Dem.Z(5,16)=NaN;
 q=problem3.linkState(a,b,"access",tiny);
 assert(~q.Available && q.UnknownTerrain);
+% 密集采样加速必须与逐点射线判断一致，包括重复点、遮挡与 NoData。
+points=[a;b;far;a;0.003,0.0004,150];
+for kind=["direct","access","backhaul"]
+    batch=problem3.linkAvailableBatch(points,b,kind,tiny);
+    for j=1:size(points,1)
+        exact=problem3.linkState(points(j,:),b,kind,tiny);
+        assert(batch(j)==exact.Available,'批量链路与精确射线判断不一致。');
+    end
+end
 
 % 扫掠三角形仅从像元角部经过，端点视线均避开该 NoData 像元。
 % 认证器必须检查半对角线范围内的闭合像元，不能将整段误判为可用。
@@ -49,6 +59,42 @@ mock=struct('Phases',phase);
 assert(problem3.linkState(p0,f,"direct",tiny).Available);
 assert(problem3.linkState(p1,f,"direct",tiny).Available);
 assert(~problem3.certifyCoverage(mock,table(),tiny,struct()).Feasible);
+% 即使粗采样只看到两端正常，也必须拒绝中间短暂失联。
+phase.End_s=0.4; mock.Phases=phase;
+assert(isempty(problem3.sampleGaps(mock,tiny,1)));
+assert(~problem3.certifyCoverage(mock,table(),tiny,struct()).Feasible);
+% 有限地形快速分支以及不同距离/高度，与逐点算法逐项对照。
+savedRng=rng; rng(761);
+% 矢量化通信射线与公共闭合像元遍历独立对照，覆盖角点、沿边及反向射线。
+grid=struct('Z',zeros(30,40),'Lon',(1:40),'Lat',(1:30)', ...
+    'dLon',1,'dLat',1);
+rays=[1,1,40,30;1.5,1.5,39.5,29.5;2.5,1,2.5,30;1,3.5,40,3.5; ...
+    1.5,1.5,1.5,1.5;39.5,29.5,1.5,1.5; ...
+    1+38*rand(100,1),1+28*rand(100,1),1+38*rand(100,1),1+28*rand(100,1)];
+for j=1:size(rays,1)
+    a0=rays(j,1:2); a1=rays(j,3:4);
+    oracle=common.traceDemSupercover(a0,a1,size(grid.Z));
+    [actual,lo,hi]=problem3.communicationRay([a0,100],[a1,200],grid);
+    assert(isequal(sortrows(oracle),sortrows(actual)));
+    assert(all(lo<=hi+1e-9) && all(lo>=0) && all(hi<=1));
+end
+tiny.Dem.Z(:)=0;
+points=[0.001+0.08*rand(50,1),0.0002+0.0005*rand(50,1),100+300*rand(50,1)];
+for kind=["direct","access","backhaul"]
+    batch=problem3.linkAvailableBatch(points,f,kind,tiny);
+    for j=1:size(points,1)
+        exact=problem3.linkState(points(j,:),f,kind,tiny);
+        assert(batch(j)==exact.Available);
+    end
+end
+rng(savedRng);
+% 压缩中继搜索状态不得丢掉短缺口及任何独立缺口的两端。
+tt=[0;1;2;3;4;10;10.4;20;21;22];
+gaps=table(repmat("T1",numel(tt),1),ones(numel(tt),1),tt, ...
+    zeros(numel(tt),1),zeros(numel(tt),1),zeros(numel(tt),1), ...
+    'VariableNames',{'TripID','PhaseIndex','Time_s','Lon','Lat','Alt_m'});
+sparse=problem3.compressGaps(gaps,1,10);
+assert(isequal(sparse.Time_s,[0;4;10;10.4;20;22]));
 
 % 中继高于和低于规定巡航海拔的往返、建链、悬停能耗。
 n=d.Nodes(d.Nodes.ID=="S001",:);
@@ -66,8 +112,18 @@ assert(abs((plus.Energy_kWh-high.Energy_kWh)- ...
     100*(d.Relay.HoverPower_kW+d.Relay.CommPower_kW)/3600)<1e-8);
 
 % 全数据解从零计算，并再次独立认证连续通信和全部资源约束。
-r=problem3.run_problem3(struct('NumRuns',1,'MaxIterations',0, ...
-    'TimeLimit_s',180,'ExportFiles',false,'Verbose',false));
+if isfield(config,'QuickOnly') && config.QuickOnly
+    fprintf('problem3 边界、短暂失联、批量链路一致性测试通过。\n'); return;
+end
+config.NumRuns=1;
+if ~isfield(config,'MaxIterations'), config.MaxIterations=200; end
+if ~isfield(config,'TimeLimit_s'), config.TimeLimit_s=300; end
+config.ExportFiles=false;
+if ~isfield(config,'Verbose'), config.Verbose=false; end
+if ~isfield(config,'SeedQ3ArchiveFile')
+    config.SeedQ3ArchiveFile=fullfile(p.ResultDir,'问题三_Pareto完整档案.mat');
+end
+r=problem3.run_problem3(config);
 assert(~isempty(r.ParetoFront));
 rep=r.Representatives.Balanced;
 assert(rep.Validation.Feasible && all(rep.Validation.Checks.Passed));
