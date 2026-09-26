@@ -12,20 +12,21 @@ baselineObjectives=zeros(0,5);
 runRows=cell(0,1);
 operatorRows=cell(0,1);
 try
-% 旧问题三只作为热启动；按本轮物理数据重新解码并重新认证，不能直接信任旧目标值。
-if strlength(string(config.SeedQ3ArchiveFile))>0 && isfile(config.SeedQ3ArchiveFile)
-    old=load(config.SeedQ3ArchiveFile,'saved');
-    if isfield(old,'saved') && isfield(old.saved,'ParetoSolutions')
+    % 旧问题三只作为热启动；按本轮物理数据重新解码并重新认证，不能直接信任旧目标值。
+    warmSeeds={};
+    if strlength(string(config.SeedQ3ArchiveFile))>0 && isfile(config.SeedQ3ArchiveFile)
+        old=load(config.SeedQ3ArchiveFile,'saved');
+        if isfield(old,'saved') && isfield(old.saved,'ParetoSolutions')
         for k=1:numel(old.saved.ParetoSolutions)
             problem3.checkDeadline(config);
             prev=old.saved.ParetoSolutions{k};
             tr=problem3.decodeTransport(prev.Solution,data);
             if ~tr.Feasible, continue; end
-            % 即使旧中继位置已不适用于新 DEM，其运输时序仍可供重新规划中继。
-            warmSeed=prev.Solution;
-            warmSeed.Source="旧问题三运输时序";
-            seeds{end+1}=warmSeed; %#ok<AGROW>
-            refreshed=problem3.recomputeRelay(prev.Relay,data);
+                % 即使旧中继位置已不适用于新 DEM，其运输时序仍可供重新规划中继。
+                warmSeed=prev.Solution;
+                warmSeed.Source="旧问题三运输时序";
+                warmSeeds{end+1}=warmSeed; %#ok<AGROW>
+                refreshed=problem3.recomputeRelay(prev.Relay,data);
             [rp,oc]=certifiedCandidate(prev.Solution,tr,refreshed,data,config);
             if oc.Feasible
                 [archiveSolutions,archiveOutcomes,~]=problem3.updateParetoArchive( ...
@@ -36,9 +37,12 @@ if strlength(string(config.SeedQ3ArchiveFile))>0 && isfile(config.SeedQ3ArchiveF
         for k=1:numel(archiveOutcomes)
             baselineObjectives(end+1,:)=archiveOutcomes{k}.Objectives; %#ok<AGROW>
         end
-        fprintf('[Q3] 旧问题三经本轮数据重新认证，保留 %d 个非支配方案。\n',numel(archiveOutcomes));
+            fprintf('[Q3] 旧问题三经本轮数据重新认证，保留 %d 个非支配方案。\n',numel(archiveOutcomes));
+        end
     end
-end
+    if ~isempty(warmSeeds)
+        seeds=[warmSeeds(:);seeds(:)];
+    end
 for run=1:config.NumRuns
     if toc(clock)>=config.TimeLimit_s, break; end
     runClock=tic;
@@ -68,9 +72,10 @@ for run=1:config.NumRuns
         saveCheckpoint(config,archiveSolutions,archiveOutcomes,runRows,operatorRows);
     else
         if config.Verbose, fprintf('[Q3] 初始联合方案待修复：%s\n',relay.Failure); end
-        searchConfig=config;
-        searchConfig.RelayPrecompute=pre;
-        searchConfig.TimingIterations=min(config.MaxIterations,1200);
+            searchConfig=config;
+            searchConfig.RelayPrecompute=pre;
+            searchConfig.RandomSeed=config.RandomSeed+run-1;
+            searchConfig.TimingIterations=min(config.MaxIterations,1200);
         searchConfig.TimeLimit_s=max(0,runBudget_s-toc(runClock));
         q=problem3.searchTiming(seed,data,searchConfig);
         if q.Feasible
@@ -106,7 +111,13 @@ for run=1:config.NumRuns
         end
         used=it;
         if ~isempty(currentRep.Relay.RelayTrips)
-            critical=currentRep.Transport.Trips.TripID(randi(height(currentRep.Transport.Trips)));
+            % 联合完成时间导向：以较大概率扰动决定完工时刻的最晚返航架次。
+            [~,lastIdx]=max(currentRep.Transport.Trips.Return_s);
+            if rand<0.7
+                critical=currentRep.Transport.Trips.TripID(lastIdx);
+            else
+                critical=currentRep.Transport.Trips.TripID(randi(height(currentRep.Transport.Trips)));
+            end
         else
             critical="";
         end

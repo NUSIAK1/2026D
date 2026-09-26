@@ -58,19 +58,28 @@ save(fullfile(config.ResultDir,'优化实验完整记录.mat'),'result','-v7.3')
 if isempty(result.ParetoFront)
     error('problem3:NoCertifiedSolution','本轮没有已认证可行解，详见日志及实验记录。');
 end
-names=fieldnames(result.Representatives);
-for k=1:numel(names)
-    name=names{k};
-    if config.ExportFiles
-        report=problem3.verifySubmission(result.Representatives.(name), ...
-            result.OutputFiles.Submissions.(name),p.TemplateFile);
-        assert(all(report.Passed),'正式提交簿回读校核失败。');
+    names=fieldnames(result.Representatives);
+    verification=table();
+    for k=1:numel(names)
+        name=names{k};
+        if config.ExportFiles
+            report=problem3.verifySubmission(result.Representatives.(name), ...
+                result.OutputFiles.Submissions.(name),p.TemplateFile);
+            assert(report.Feasible && all(report.Checks.Passed), ...
+                sprintf('正式提交簿 %s 回读校核失败。',name));
+            check=report.Checks;
+            check.Workbook=repmat(string(name),height(check),1);
+            verification=[verification;check]; %#ok<AGROW>
+        end
     end
-end
-summary=struct('CertifiedSolutionCount',height(result.ParetoFront), ...
-    'GapSampleStep_s',config.GapSampleStep_s,'CommMinInterval_s',config.CommMinInterval_s, ...
-    'ContinuousCertification',true,'SeedResultDir',provenance.SeedResultDir, ...
-    'FlightBaseSource',provenance.FlightBaseFile,'BaselineCount',size(result.BaselineObjectives,1));
+    summary=struct('CertifiedSolutionCount',height(result.ParetoFront), ...
+        'GapSampleStep_s',config.GapSampleStep_s,'CommMinInterval_s',config.CommMinInterval_s, ...
+        'ContinuousCertification',true,'SeedResultDir',provenance.SeedResultDir, ...
+        'FlightBaseSource',provenance.FlightBaseFile,'BaselineCount',size(result.BaselineObjectives,1), ...
+        'VerificationPassed',true);
+    if height(verification)>0
+        summary.Verification=table2struct(verification);
+    end
 fid=fopen(fullfile(config.ResultDir,'最终验收摘要.json'),'w','n','UTF-8');
 assert(fid>=0,'无法写入验收摘要。');
 fprintf(fid,'%s',jsonencode(summary,'PrettyPrint',true)); fclose(fid);

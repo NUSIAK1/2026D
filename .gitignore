@@ -19,3 +19,5 @@ codegen/
 .idea/
 Thumbs.db
 desktop.ini
+node_modules/
+__pycache__/

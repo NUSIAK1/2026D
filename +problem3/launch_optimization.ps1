@@ -1,7 +1,8 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)][string]$SeedResultDir,
     [int]$SearchSeconds = 6600,
     [string]$FlightBaseFile = '',
+    [string]$SeedQ3ArchiveFile = '',
     [switch]$Worker,
     [string]$ExperimentDir = ''
 )
@@ -12,14 +13,19 @@ if ($SearchSeconds -le 0 -or $SearchSeconds -gt 6600) { throw '搜索时间须�
 if (-not (Test-Path -LiteralPath $SeedResultDir -PathType Container)) { throw '指定问题二结果目录不存在。' }
 if (-not $FlightBaseFile) { $FlightBaseFile = Join-Path $codeDir 'cache/flightBase.mat' }
 if (-not (Test-Path -LiteralPath $FlightBaseFile -PathType Leaf)) { throw '基础矩阵不存在。' }
+if ($SeedQ3ArchiveFile -and -not (Test-Path -LiteralPath $SeedQ3ArchiveFile -PathType Leaf)) { throw '指定问题三热启动档案不存在。' }
 if (-not $Worker) {
     $tag = (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N').Substring(0,8)
     $ExperimentDir = Join-Path (Join-Path $projectDir '结果/问题三_优化实验') $tag
     New-Item -ItemType Directory -Path $ExperimentDir | Out-Null
     $shellPath = (Get-Process -Id $PID).Path
+    $archiveArgs = @()
+    if ($SeedQ3ArchiveFile) {
+        $archiveArgs = @('-SeedQ3ArchiveFile',('"' + $SeedQ3ArchiveFile + '"'))
+    }
     $arguments = @('-NoProfile','-File',('"' + $PSCommandPath + '"'),'-Worker',
         '-SeedResultDir',('"' + $SeedResultDir + '"'),'-FlightBaseFile',('"' + $FlightBaseFile + '"'),
-        '-SearchSeconds',$SearchSeconds,'-ExperimentDir',('"' + $ExperimentDir + '"'))
+        '-SearchSeconds',$SearchSeconds,'-ExperimentDir',('"' + $ExperimentDir + '"')) + $archiveArgs
     $job = Start-Process -FilePath $shellPath -ArgumentList $arguments -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $ExperimentDir '守护进程输出.txt') `
         -RedirectStandardError (Join-Path $ExperimentDir '守护进程错误.txt')
@@ -46,11 +52,15 @@ try {
         ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ExperimentDir '源码SHA256.json') -Encoding UTF8
     $env:Q3_SEED_DIR = (Resolve-Path -LiteralPath $SeedResultDir).Path
     $env:Q3_FLIGHT_BASE = (Resolve-Path -LiteralPath $FlightBaseFile).Path
+    $env:Q3_SEED_Q3_ARCHIVE = ''
+    if ($SeedQ3ArchiveFile) {
+        $env:Q3_SEED_Q3_ARCHIVE = (Resolve-Path -LiteralPath $SeedQ3ArchiveFile).Path
+    }
     $env:Q3_OUTPUT_DIR = $ExperimentDir
     $env:Q3_SEARCH_SECONDS = [string]$SearchSeconds
     $env:MATLAB_PREFDIR = Join-Path $ExperimentDir 'MATLAB偏好'
     New-Item -ItemType Directory -Path $env:MATLAB_PREFDIR | Out-Null
-    $command = "r=problem3.run_optimization(struct('SeedResultDir',getenv('Q3_SEED_DIR'),'FlightBaseFile',getenv('Q3_FLIGHT_BASE'),'ExperimentDir',getenv('Q3_OUTPUT_DIR'),'TimeLimit_s',str2double(getenv('Q3_SEARCH_SECONDS'))));"
+    $command = "r=problem3.run_optimization(struct('SeedResultDir',getenv('Q3_SEED_DIR'),'FlightBaseFile',getenv('Q3_FLIGHT_BASE'),'SeedQ3ArchiveFile',getenv('Q3_SEED_Q3_ARCHIVE'),'ExperimentDir',getenv('Q3_OUTPUT_DIR'),'TimeLimit_s',str2double(getenv('Q3_SEARCH_SECONDS'))));"
     $arguments = '-wait -singleCompThread -batch "{0}" -logfile "{1}"' -f $command,(Join-Path $ExperimentDir 'MATLAB运行日志.txt')
     $matlab = (Get-Command matlab -ErrorAction Stop).Source
     $process = Start-Process -FilePath $matlab -ArgumentList $arguments -WorkingDirectory $snapshot -WindowStyle Hidden -PassThru `
@@ -58,7 +68,7 @@ try {
         -RedirectStandardError (Join-Path $ExperimentDir '启动错误输出.txt')
     try { $process.PriorityClass = 'BelowNormal' } catch { }
     @{ PID=$process.Id; Started=(Get-Date).ToString('o'); SearchSeconds=$SearchSeconds; WallLimitSeconds=7200;
-        SeedResultDir=$SeedResultDir; FlightBaseFile=$FlightBaseFile; ExperimentDir=$ExperimentDir } |
+        SeedResultDir=$SeedResultDir; FlightBaseFile=$FlightBaseFile; SeedQ3ArchiveFile=$SeedQ3ArchiveFile; ExperimentDir=$ExperimentDir } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ExperimentDir '启动信息.json') -Encoding UTF8
     $timedOut = -not $process.WaitForExit(7200000)
     if ($timedOut) {

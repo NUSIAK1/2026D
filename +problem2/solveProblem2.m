@@ -84,9 +84,11 @@ neighborhoodAdded = zeros(numel(operatorNames),1);
 localSolutions = {}; localOutcomes = {}; localAdded = 0;
 completedIterations = 0;
 plannedIterations = config.NumRuns*config.MaxIterations;
+bestExtremes = [inf inf inf inf];
+lastExtremeImprove_s = 0;
 
 for runIdx = 1:config.NumRuns
-    if toc(overallClock) >= config.TimeLimit_s
+    if toc(overallClock) >= currentLimit()
         break;
     end
     if config.ProgressEnabled
@@ -119,11 +121,11 @@ for runIdx = 1:config.NumRuns
     stagnant = 0;
     accepted = 0;
     runClock = tic;
-    runBudget_s = max(0,(config.TimeLimit_s-toc(overallClock))/ ...
+    runBudget_s = max(0,(currentLimit()-toc(overallClock))/ ...
         (config.NumRuns-runIdx+1));
     actualIterations = 0;
     for iter = 1:config.MaxIterations
-        if toc(overallClock) >= config.TimeLimit_s || toc(runClock) >= runBudget_s
+        if toc(overallClock) >= currentLimit() || toc(runClock) >= runBudget_s
             break;
         end
         operator = roulette(destroyScore);
@@ -199,6 +201,10 @@ for runIdx = 1:config.NumRuns
         actualIterations = actualIterations+1;
         completedIterations = completedIterations+1;
         [bestObjectives,bestCount] = archiveSummary(archiveOutcomes);
+        if any(bestObjectives < bestExtremes-1e-9)
+            bestExtremes = min(bestExtremes,bestObjectives);
+            lastExtremeImprove_s = toc(overallClock);
+        end
         if completedIterations > size(convergenceRows,1)
             convergenceRows(end+4096,10) = 0;
             convergenceProfiles(end+4096,1) = "";
@@ -300,6 +306,11 @@ result.OperatorLog = operatorLog;
 result.SeedDiagnostics = seedDiagnostics;
 result.SeedReevaluation = seedReevaluation;
 result.SearchElapsed_s = toc(overallClock);
+result.AdaptiveBudget = struct('BaseLimit_s',config.TimeLimit_s, ...
+    'MaxLimit_s',config.MaxTimeLimit_s,'AdaptiveExtend',config.AdaptiveExtend, ...
+    'AdaptiveWindow_s',config.AdaptiveWindow_s, ...
+    'LastExtremeImprove_s',lastExtremeImprove_s, ...
+    'EffectiveElapsed_s',result.SearchElapsed_s);
 result.OperatorDiagnostics = table(operatorNames.',operatorCounts(:,1), ...
     operatorCounts(:,2),operatorCounts(:,3),operatorCounts(:,4), ...
     operatorCounts(:,5),operatorCounts(:,6),operatorCounts(:,7), ...
@@ -339,12 +350,21 @@ end
             neighborhoodAdded(operator) = neighborhoodAdded(operator)+1;
         end
     end
+
+    function limit = currentLimit()
+    % 自适应预算：基准时长跑完后，只有近期极值仍在改善才继续延长至上限。
+        limit = config.TimeLimit_s;
+        if config.AdaptiveExtend
+            limit = min(config.MaxTimeLimit_s, ...
+                max(limit, lastExtremeImprove_s+config.AdaptiveWindow_s));
+        end
+    end
 end
 
 function config = applyDefaults(config)
 paths = common.projectPaths();
 defaults = struct( ...
-    'AlgorithmVersion',"q2-visible-lexicographic-v4", ...
+    'AlgorithmVersion',"q2-rebalance-insert-v5", ...
     'FlightBaseFile',paths.FlightBaseFile, ...
     'DemandFile',paths.DemandFile, ...
     'TransportUavFile',paths.TransportUavFile, ...
@@ -355,6 +375,9 @@ defaults = struct( ...
     'NumRuns',10, ...
     'MaxIterations',2500, ...
     'TimeLimit_s',1200, ...
+    'MaxTimeLimit_s',0, ...
+    'AdaptiveExtend',false, ...
+    'AdaptiveWindow_s',1200, ...
     'StagnationLimit',800, ...
     'ArchiveSize',200, ...
     'RestartEvery',120, ...
@@ -383,6 +406,13 @@ end
 config.SeedEvaluationMode = string(config.SeedEvaluationMode);
 assert(isscalar(config.SeedEvaluationMode) && ...
     any(config.SeedEvaluationMode == ["strict","recompute"]),'无效的旧档案评价模式。');
+config.AdaptiveExtend = logical(config.AdaptiveExtend);
+if ~isfinite(config.MaxTimeLimit_s) || config.MaxTimeLimit_s <= 0
+    config.MaxTimeLimit_s = config.TimeLimit_s;
+end
+assert(config.MaxTimeLimit_s >= config.TimeLimit_s, ...
+    '自适应预算上限不能小于基准搜索预算。');
+assert(config.AdaptiveWindow_s > 0,'自适应观察窗口必须为正。');
 end
 
 function data = loadProblemData(config, flightBase)
@@ -763,7 +793,7 @@ end
 solution = removeBoxes(solution,remove,data);
 remove = remove(randperm(numel(remove)));
 for k = 1:numel(remove)
-    solution = insertBoxGreedy(solution,remove(k),data,base);
+    solution = insertBoxGreedy(solution,remove(k),data,base,profile);
 end
 
 end
@@ -867,6 +897,37 @@ for r = pool
         value = compareOutcomes(out,bestOutcome,profile);
         if out.Feasible && value < -1e-12
             solution = trial; bestOutcome = out;
+        end
+    end
+end
+% 成对机型联合交换：把瓶颈机型(C)的活搬到闲置机型(A/B)，一次同时换两架次。
+if numel(pool) >= 2
+    pairs = nchoosek(pool,2);
+    pairs = pairs(randperm(size(pairs,1),min(size(pairs,1),6)),:);
+    for pi = 1:size(pairs,1)
+        r1 = pairs(pi,1); r2 = pairs(pi,2);
+        m1 = capacityModels(source.Trips(r1).BoxIdx,data);
+        m2 = capacityModels(source.Trips(r2).BoxIdx,data);
+        if isempty(m1) || isempty(m2), continue; end
+        cnt = 0;
+        for a = reshape(m1,1,[])
+            for b = reshape(m2,1,[])
+                if a == source.Trips(r1).Model && b == source.Trips(r2).Model, continue; end
+                trial = source;
+                trial.Trips(r1).Model = a;
+                trial.Trips(r2).Model = b;
+                if ~evaluateTrip(trial.Trips(r1),data,base).Feasible || ...
+                        ~evaluateTrip(trial.Trips(r2),data,base).Feasible, continue; end
+                out = decodeSolution(trial,data,base);
+                visit(trial,out);
+                value = compareOutcomes(out,bestOutcome,profile);
+                if out.Feasible && value < -1e-12
+                    solution = trial; bestOutcome = out;
+                end
+                cnt = cnt+1;
+                if cnt >= 24, break; end
+            end
+            if cnt >= 24, break; end
         end
     end
 end
@@ -1020,6 +1081,38 @@ for r = critical(randperm(numel(critical)))
         sourceTrip.BoxIdx = remaining;
         sourceTrip.Stops = stopsForBoxes(remaining,trip.Stops,data);
         if ~evaluateTrip(sourceTrip,data,base).Feasible, continue; end
+        % 分支一：拆出的箱子并入已有架次（可换机型），直接给瓶颈机型减负。
+        targets = randperm(numel(solution.Trips));
+        targets = targets(targets ~= r);
+        targets = targets(1:min(6,numel(targets)));
+        for target = targets
+            recipient = solution.Trips(target);
+            candBox = [recipient.BoxIdx,move];
+            rModels = unique([recipient.Model;capacityModels(candBox,data)],'stable');
+            for rm = reshape(rModels,1,[])
+                rec = recipient;
+                rec.BoxIdx = candBox;
+                rec.Stops = stopsForBoxes(candBox,recipient.Stops,data);
+                rec.Model = rm;
+                if ~evaluateTrip(rec,data,base).Feasible, continue; end
+                candSol = solution;
+                candSol.Trips(r) = sourceTrip;
+                candSol.Trips(target) = rec;
+                out = decodeSolution(candSol,data,base);
+                visit(candSol,out);
+                fullDecodes = fullDecodes+1;
+                if out.Feasible
+                    value = compareOutcomes(out,bestOutcome,profile);
+                    if value < -1e-12
+                        best = candSol; bestOutcome = out;
+                    end
+                end
+                if fullDecodes >= 24, break; end
+            end
+            if fullDecodes >= 24, break; end
+        end
+        if fullDecodes >= 24, break; end
+        % 分支二：拆成新架次（原逻辑，保留新增并行容量的能力）。
         models = capacityModels(move,data);
         for model = reshape(models(randperm(numel(models))),1,[])
             newTrip = struct('BoxIdx',{move}, ...
@@ -1044,13 +1137,13 @@ for r = critical(randperm(numel(critical)))
                         bestOutcome = out;
                     end
                 end
-                if fullDecodes >= 16, break; end
+                if fullDecodes >= 24, break; end
             end
-            if fullDecodes >= 16, break; end
+            if fullDecodes >= 24, break; end
         end
-        if fullDecodes >= 16, break; end
+        if fullDecodes >= 24, break; end
     end
-    if fullDecodes >= 16, break; end
+    if fullDecodes >= 24, break; end
 end
 solution = best;
 end
@@ -1069,87 +1162,102 @@ for r = critical
         for target = randperm(numel(solution.Trips))
             if target == r, continue; end
             recipient = solution.Trips(target);
-            service = data.Boxes.ServiceID(box);
-            recipient.BoxIdx = [recipient.BoxIdx,box];
-            if ~any(recipient.Stops == service)
-                recipient.Stops = [recipient.Stops,service];
-            end
-            if ~evaluateTrip(recipient,data,base).Feasible, continue; end
-            remaining = setdiff(source.BoxIdx,box,'stable');
-            donor = source;
-            donor.BoxIdx = remaining;
-            donor.Stops = stopsForBoxes(remaining,source.Stops,data);
-            if ~evaluateTrip(donor,data,base).Feasible, continue; end
-            trial = solution;
-            trial.Trips(r) = donor;
-            trial.Trips(target) = recipient;
-            out = decodeSolution(trial,data,base);
-        visit(trial,out);
-            fullDecodes = fullDecodes+1;
-            if out.Feasible
-                value = compareOutcomes(out,bestOutcome,profile);
-                if value < -1e-12
-                    best = trial;
-                    bestOutcome = out;
+            candBox = [recipient.BoxIdx,box];
+            % 接收架次可换机型：把瓶颈货箱搬去轻载机型。
+            rModels = unique([recipient.Model;capacityModels(candBox,data)],'stable');
+            for rm = reshape(rModels,1,[])
+                rec = recipient;
+                rec.BoxIdx = candBox;
+                rec.Stops = stopsForBoxes(candBox,recipient.Stops,data);
+                rec.Model = rm;
+                if ~evaluateTrip(rec,data,base).Feasible, continue; end
+                remaining = setdiff(source.BoxIdx,box,'stable');
+                donor = source;
+                donor.BoxIdx = remaining;
+                donor.Stops = stopsForBoxes(remaining,source.Stops,data);
+                if ~evaluateTrip(donor,data,base).Feasible, continue; end
+                trial = solution;
+                trial.Trips(r) = donor;
+                trial.Trips(target) = rec;
+                out = decodeSolution(trial,data,base);
+                visit(trial,out);
+                fullDecodes = fullDecodes+1;
+                if out.Feasible
+                    value = compareOutcomes(out,bestOutcome,profile);
+                    if value < -1e-12
+                        best = trial;
+                        bestOutcome = out;
+                    end
                 end
+                if fullDecodes >= 16, break; end
             end
-            if fullDecodes >= 12, break; end
+            if fullDecodes >= 16, break; end
         end
-        if fullDecodes >= 12, break; end
+        if fullDecodes >= 16, break; end
     end
-    if fullDecodes >= 12, break; end
+    if fullDecodes >= 16, break; end
 end
 solution = best;
 end
 
-function solution = insertBoxGreedy(solution,boxIdx,data,base)
-best = []; bestScore = inf;
+function solution = insertBoxGreedy(solution,boxIdx,data,base,profile)
+% 按当前优化方向与机队负载均衡选择插入位置，不再只按单架次时长+能耗。
+if nargin < 5 || isempty(profile), profile = "balanced"; end
+service = data.Boxes.ServiceID(boxIdx);
+work = modelWorkload(solution,data,base);
+candidates = {}; scores = zeros(1,0);
 for r = 1:numel(solution.Trips)
     original = solution.Trips(r);
-    service = data.Boxes.ServiceID(boxIdx);
     originalInfo = evaluateTrip(original,data,base);
     if ~originalInfo.Feasible, continue; end
     if any(original.Stops == service)
-        candidate = original;
-        candidate.BoxIdx = [candidate.BoxIdx,boxIdx];
-        models = capacityModels(candidate.BoxIdx,data);
-        models = unique([candidate.Model;models],'stable');
+        cand = original;
+        cand.BoxIdx = [cand.BoxIdx,boxIdx];
+        models = unique([cand.Model;capacityModels(cand.BoxIdx,data)],'stable');
         for g = 1:numel(models)
-            candidate.Model = models(g);
-            info = evaluateTrip(candidate,data,base);
-            delta = tripScore(info)-tripScore(originalInfo);
-            if info.Feasible && delta < bestScore
-                best = struct('Trip',candidate,'Index',r); bestScore = delta;
+            cand.Model = models(g);
+            info = evaluateTrip(cand,data,base);
+            if info.Feasible
+                candidates{end+1} = struct('Trip',cand,'Index',r); %#ok<AGROW>
+                scores(end+1) = insertScore(info,originalInfo,false, ... %#ok<AGROW>
+                    cand.Model,data,work,profile);
             end
         end
     else
         for pos = 1:numel(original.Stops)+1
-            candidate = original;
-            candidate.BoxIdx = [candidate.BoxIdx,boxIdx];
-            candidate.Stops = [candidate.Stops(1:pos-1),service,candidate.Stops(pos:end)];
-            models = capacityModels(candidate.BoxIdx,data);
+            cand = original;
+            cand.BoxIdx = [cand.BoxIdx,boxIdx];
+            cand.Stops = [cand.Stops(1:pos-1),service,cand.Stops(pos:end)];
+            models = unique([cand.Model;capacityModels(cand.BoxIdx,data)],'stable');
             for g = 1:numel(models)
-                candidate.Model = models(g);
-                info = evaluateTrip(candidate,data,base);
-                delta = tripScore(info)-tripScore(originalInfo);
-                if info.Feasible && delta < bestScore
-                    best = struct('Trip',candidate,'Index',r); bestScore = delta;
+                cand.Model = models(g);
+                info = evaluateTrip(cand,data,base);
+                if info.Feasible
+                    candidates{end+1} = struct('Trip',cand,'Index',r); %#ok<AGROW>
+                    scores(end+1) = insertScore(info,originalInfo,false, ... %#ok<AGROW>
+                        cand.Model,data,work,profile);
                 end
             end
         end
     end
 end
-service = data.Boxes.ServiceID(boxIdx);
 for g = 1:height(data.Models)
-    candidate = struct('BoxIdx',boxIdx,'Stops',service,'Model',data.Models.Model(g));
-    info = evaluateTrip(candidate,data,base);
-    if info.Feasible && tripScore(info) < bestScore
-        best = struct('Trip',candidate,'Index',0); bestScore = tripScore(info);
+    cand = struct('BoxIdx',boxIdx,'Stops',service,'Model',data.Models.Model(g));
+    info = evaluateTrip(cand,data,base);
+    if info.Feasible
+        candidates{end+1} = struct('Trip',cand,'Index',0); %#ok<AGROW>
+        scores(end+1) = insertScore(info,[],true,cand.Model,data,work,profile); %#ok<AGROW>
     end
 end
-if isempty(best)
+if isempty(candidates)
     error('货箱 %s 无法由任一机型单独运输。',data.Boxes.BoxID(boxIdx));
 end
+% 软随机选 top-3，保持插入多样性又不偏离主方向。
+[~,order] = sort(scores,'ascend');
+k = min(3,numel(order));
+pick = find(rand <= cumsum([0.6,0.25,0.15]),1);
+if isempty(pick), pick = k; end
+best = candidates{order(pick)};
 if best.Index == 0
     solution.Trips(end+1) = best.Trip;
     solution.Order = [solution.Order,numel(solution.Trips)];
@@ -1542,8 +1650,26 @@ function op = roulette(weights)
 c = cumsum(weights/sum(weights)); op = find(rand <= c,1); if isempty(op), op=numel(weights); end
 end
 
-function value = tripScore(info)
-value = info.Duration_s+400*info.Energy_kWh;
+function value = insertScore(info,originalInfo,isNew,model,data,work,profile)
+% 插入边际成本：makespan 方向按“给该机型增加的每人工作量”摊薄，并偏好轻载机型。
+gi = find(data.Models.Model == model,1);
+drones = nnz(data.Drones.Model == model);
+if isNew
+    dDur = info.Duration_s; dEne = info.Energy_kWh;
+else
+    dDur = info.Duration_s-originalInfo.Duration_s;
+    dEne = info.Energy_kWh-originalInfo.Energy_kWh;
+end
+switch profile
+    case "makespan"
+        value = dDur/max(drones,1)+0.25*dEne+0.05*work.WorkPerDrone_s(gi);
+    case "energy"
+        value = dEne+0.02*dDur;
+    case "trips"
+        value = dDur+400*dEne+1000*double(isNew);
+    otherwise % timeliness / balanced 沿用原时长+能耗尺度
+        value = dDur+400*dEne;
+end
 end
 
 function full = batteryFullTime(model,data)
